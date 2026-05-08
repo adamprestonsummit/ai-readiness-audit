@@ -46,7 +46,7 @@ def get_gemini_client():
         st.error("GEMINI_API_KEY not found. Add it to Streamlit secrets.")
         st.stop()
     genai.configure(api_key=api_key)
-    return genai.GenerativeModel("gemini-2.5-flash")
+    return genai.GenerativeModel("gemini-2.0-flash")
 
 # ─── Fetch URL HTML ───────────────────────────────────────────────────────────
 def fetch_pages(domain: str, extra_urls: list[str]) -> dict[str, str]:
@@ -88,6 +88,13 @@ Score EACH page 1-10 across these 8 dimensions:
 6. ALT TEXT – image alt attribute quality and completeness
 7. CRAWL – server-rendered static HTML vs JS dependency
 8. LLM – first-hand expertise, named entities, dates, citations, authority signals
+
+CRITICAL RULES:
+- Return ONLY raw JSON. No markdown, no ```json fences, no preamble, no explanation.
+- All string values must use double quotes. Never use single quotes inside JSON strings.
+- Escape any double quotes inside string values with a backslash.
+- Do not include trailing commas after the last item in any array or object.
+- Every string value must be on a single line with no literal newlines inside strings.
 
 Return ONLY valid JSON in exactly this structure:
 {
@@ -145,6 +152,45 @@ Return ONLY valid JSON in exactly this structure:
 }
 """
 
+def clean_json_string(raw: str) -> str:
+    """Strip markdown fences and extract the outermost JSON object."""
+    raw = raw.strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    raw = raw.strip()
+    start = raw.find("{")
+    end   = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        raw = raw[start:end+1]
+    return raw
+
+
+def repair_and_parse(raw: str) -> dict:
+    """Try several strategies to parse potentially malformed JSON."""
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    try:
+        import json_repair  # type: ignore
+        return json_repair.repair_json(raw, return_objects=True)
+    except Exception:
+        pass
+
+    # Manual fixes: trailing commas, curly/smart quotes
+    fixed = raw
+    fixed = re.sub(r",\s*([}\]])", r"\1", fixed)
+    fixed = fixed.replace("\u201c", '"').replace("\u201d", '"')
+    fixed = fixed.replace("\u2018", "'").replace("\u2019", "'")
+    try:
+        return json.loads(fixed)
+    except json.JSONDecodeError:
+        pass
+
+    raise ValueError(f"Could not parse Gemini response as JSON. First 300 chars:\n{raw[:300]}")
+
+
 def run_audit(model, pages: dict) -> dict:
     pages_text = ""
     for url, html in pages.items():
@@ -152,13 +198,25 @@ def run_audit(model, pages: dict) -> dict:
 
     response = model.generate_content(
         AUDIT_PROMPT + "\n\nPages to audit:\n" + pages_text,
-        generation_config={"temperature": 0.2, "max_output_tokens": 8192},
+        generation_config={"temperature": 0.1, "max_output_tokens": 8192},
     )
-    raw = response.text.strip()
-    # strip markdown fences if present
-    raw = re.sub(r"^```json\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
-    return json.loads(raw)
+    raw = clean_json_string(response.text)
+
+    try:
+        return repair_and_parse(raw)
+    except ValueError:
+        # Retry: ask Gemini to fix its own output
+        fix_prompt = (
+            "The following text should be valid JSON but contains errors. "
+            "Return ONLY the corrected JSON object with no other text, "
+            "no markdown fences, no explanation:\n\n" + raw[:6000]
+        )
+        retry = model.generate_content(
+            fix_prompt,
+            generation_config={"temperature": 0.0, "max_output_tokens": 8192},
+        )
+        raw2 = clean_json_string(retry.text)
+        return repair_and_parse(raw2)
 
 # ─── Score colour ─────────────────────────────────────────────────────────────
 def score_color(s):
