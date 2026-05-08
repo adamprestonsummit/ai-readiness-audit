@@ -46,7 +46,7 @@ def get_gemini_client():
         st.error("GEMINI_API_KEY not found. Add it to Streamlit secrets.")
         st.stop()
     genai.configure(api_key=api_key)
-    return genai.GenerativeModel("gemini-2.5-flash")
+    return genai.GenerativeModel("gemini-2.5-flash-preview-05-20")
 
 # ─── Fetch URL HTML ───────────────────────────────────────────────────────────
 def fetch_pages(domain: str, extra_urls: list[str]) -> dict[str, str]:
@@ -255,6 +255,15 @@ def build_docx(data: dict, month_year: str) -> bytes:
         page["dim_colors"] = {k: score_color_hex(dims.get(k, {}).get("score", 0)) for k in dim_keys}
         page["score_color"] = score_color_hex(page.get("score", 0))
 
+    # Ensure docx npm package is available — install locally if not found globally
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    node_modules = os.path.join(app_dir, "node_modules")
+    if not os.path.exists(os.path.join(node_modules, "docx")):
+        subprocess.run(
+            ["npm", "install", "docx", "--prefix", app_dir],
+            capture_output=True, timeout=120
+        )
+
     # Write data JSON to temp file
     data_file = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
     _json.dump(enriched, data_file, ensure_ascii=True)
@@ -365,7 +374,7 @@ const footerChildren = [
     txt('SUMMITMEDIA.CO.UK', { size: 16, color: '6B6B6B' }),
     txt('\t\tPREPARED BY SUMMIT \u00b7 AI VISIBILITY PRACTICE', { size: 16, color: '6B6B6B' }),
     txt('\t\t', { size: 16 }),
-    new TextRun({ children: [new PageNumber()], font: 'Arial', size: 16, color: '6B6B6B' }),
+    new TextRun({ children: [PageNumber.CURRENT], font: 'Arial', size: 16, color: '6B6B6B' }),
   ]),
 ];
 
@@ -591,8 +600,14 @@ Packer.toBuffer(doc).then(function(buf) {
     script_file.close()
 
     out_path = "/tmp/audit_output.docx"
+    app_dir = os.path.dirname(os.path.abspath(__file__))
     env = os.environ.copy()
-    env["NODE_PATH"] = "/home/claude/.npm-global/lib/node_modules"
+    # Include both local (app dir) and global npm paths
+    local_modules  = os.path.join(app_dir, "node_modules")
+    global_modules = subprocess.run(
+        ["npm", "root", "-g"], capture_output=True, text=True
+    ).stdout.strip()
+    env["NODE_PATH"] = local_modules + os.pathsep + global_modules
     result = subprocess.run(
         ["node", script_file.name, data_file.name, out_path],
         capture_output=True, text=True, timeout=90,
