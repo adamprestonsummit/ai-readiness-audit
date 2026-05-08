@@ -46,7 +46,7 @@ def get_gemini_client():
         st.error("GEMINI_API_KEY not found. Add it to Streamlit secrets.")
         st.stop()
     genai.configure(api_key=api_key)
-    return genai.GenerativeModel("gemini-2.5-flash")
+    return genai.GenerativeModel("gemini-2.5-flash-preview-04-17")
 
 # ─── Fetch URL HTML ───────────────────────────────────────────────────────────
 def fetch_pages(domain: str, extra_urls: list[str]) -> dict[str, str]:
@@ -591,9 +591,12 @@ Packer.toBuffer(doc).then(function(buf) {
     script_file.close()
 
     out_path = "/tmp/audit_output.docx"
+    env = os.environ.copy()
+    env["NODE_PATH"] = "/home/claude/.npm-global/lib/node_modules"
     result = subprocess.run(
         ["node", script_file.name, data_file.name, out_path],
-        capture_output=True, text=True, timeout=90
+        capture_output=True, text=True, timeout=90,
+        env=env
     )
     os.unlink(script_file.name)
     os.unlink(data_file.name)
@@ -609,235 +612,328 @@ Packer.toBuffer(doc).then(function(buf) {
 
 # ─── Build One-Pager PDF ──────────────────────────────────────────────────────
 def build_onepager(data: dict, month_year: str) -> bytes:
-    company = data.get("company_name", "Client")
-    domain  = data.get("domain", "")
-    avg     = data.get("average_score", 0)
-    dim_avg = data.get("dimension_averages", {})
-    summary_short = data.get("executive_summary", "")[:600]
-    working = data.get("whats_working", [])[:3]
-    holding = data.get("whats_holding_back", [])[:3]
-    wins    = data.get("three_quick_wins", [])
+    import re as _re
+
+    company       = data.get("company_name", "Client")
+    domain        = data.get("domain", "")
+    avg           = int(data.get("average_score", 0))
+    dim_avg       = data.get("dimension_averages", {})
+    exec_summary  = data.get("executive_summary", "")
+    working       = data.get("whats_working", [])[:3]
+    holding       = data.get("whats_holding_back", [])[:3]
+    wins          = data.get("three_quick_wins", [])[:3]
 
     dim_keys   = ["aria","schema","headings","meta","links","alt_text","crawl","llm"]
     dim_labels = ["ARIA","SCHEMA","HEADINGS","META","LINKS","ALT TEXT","CRAWL","LLM"]
 
-    SUMMIT_RED_RL   = colors.HexColor("#D93B1A")
-    SUMMIT_DARK_RL  = colors.HexColor("#1A1A1A")
-    SUMMIT_GREY_RL  = colors.HexColor("#6B6B6B")
-    SUMMIT_LIGHT_RL = colors.HexColor("#F5F4F2")
-    WHITE_RL        = colors.white
+    RED   = colors.HexColor("#D93B1A")
+    DARK  = colors.HexColor("#1A1A1A")
+    GREY  = colors.HexColor("#6B6B6B")
+    LIGHT = colors.HexColor("#F5F4F2")
+    GREEN = colors.HexColor("#27AE60")
+    AMBER = colors.HexColor("#E67E22")
+    WHITE = colors.white
+
+    def dim_color(s):
+        if s <= 2: return colors.HexColor("#C0392B")
+        if s <= 5: return colors.HexColor("#E67E22")
+        return colors.HexColor("#27AE60")
+
+    def safe(text):
+        """Escape XML special chars for ReportLab paragraphs."""
+        return str(text).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
     buf = BytesIO()
+
+    # Page: A4, tight margins to give maximum layout room
+    PAGE_W, PAGE_H = A4
+    ML = MR = 14*mm
+    MT = MB = 12*mm
+    W = PAGE_W - ML - MR   # usable width ~182mm
+
     doc = SimpleDocTemplate(
         buf, pagesize=A4,
-        leftMargin=15*mm, rightMargin=15*mm,
-        topMargin=15*mm, bottomMargin=15*mm,
+        leftMargin=ML, rightMargin=MR,
+        topMargin=MT, bottomMargin=MB,
     )
-    W = A4[0] - 30*mm
 
-    def sty(name="Normal", **kw):
-        defaults = dict(fontName="Helvetica", fontSize=9, leading=12, textColor=SUMMIT_DARK_RL)
-        defaults.update(kw)
-        return ParagraphStyle(name, **defaults)
+    # ── Style factory ────────────────────────────────────────────────
+    _style_cache = {}
+    def S(name, **kw):
+        key = name + str(sorted(kw.items()))
+        if key not in _style_cache:
+            base = dict(fontName="Helvetica", fontSize=8, leading=11,
+                        textColor=DARK, spaceAfter=0, spaceBefore=0)
+            base.update(kw)
+            _style_cache[key] = ParagraphStyle(name + str(len(_style_cache)), **base)
+        return _style_cache[key]
+
+    def P(markup, **kw):
+        return Paragraph(markup, S("p", **kw))
 
     story = []
 
-    # ── Header bar ──────────────────────────────────────────────────
-    logo_w, logo_h = 35, 35
-    header_data = [[
-        RLImage(LOGO_PATH, width=logo_w, height=logo_h),
-        Paragraph(
-            f'<font name="Helvetica-Bold" size="7" color="#6B6B6B">'
-            f'AI VISIBILITY SNAPSHOT<br/>{company.upper()} · {month_year.upper()}</font>',
-            sty(alignment=TA_RIGHT)
-        )
-    ]]
-    ht = Table(header_data, colWidths=[logo_w+5*mm, W - logo_w - 5*mm])
-    ht.setStyle(TableStyle([
-        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-        ("LINEBELOW", (0,0), (-1,0), 2, SUMMIT_RED_RL),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 4),
-    ]))
-    story.append(ht)
-    story.append(Spacer(1, 6*mm))
+    # ════════════════════════════════════════════════════════════════
+    # 1. HEADER — logo left, tag right
+    # ════════════════════════════════════════════════════════════════
+    LOGO_W = LOGO_H = 32
 
-    # ── Hero headline ────────────────────────────────────────────────
-    story.append(Paragraph(
-        f'<font name="Helvetica-Bold" size="22">Is your site ready<br/>'
+    logo_cell = RLImage(LOGO_PATH, width=LOGO_W, height=LOGO_H) if os.path.exists(LOGO_PATH) else P("")
+    tag_markup = (
+        f'<font name="Helvetica" size="6.5" color="#6B6B6B">'
+        f'AI VISIBILITY SNAPSHOT<br/>'
+        f'{safe(company).upper()} &middot; {safe(month_year).upper()}</font>'
+    )
+    hdr = Table(
+        [[logo_cell, P(tag_markup, alignment=TA_RIGHT, leading=9)]],
+        colWidths=[LOGO_W + 4*mm, W - LOGO_W - 4*mm],
+        rowHeights=[LOGO_H],
+    )
+    hdr.setStyle(TableStyle([
+        ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+        ("LEFTPADDING",   (0,0), (-1,-1), 0),
+        ("RIGHTPADDING",  (0,0), (-1,-1), 0),
+        ("TOPPADDING",    (0,0), (-1,-1), 0),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+        ("LINEBELOW",     (0,0), (-1,-1), 1.5, RED),
+    ]))
+    story.append(hdr)
+    story.append(Spacer(1, 5*mm))
+
+    # ════════════════════════════════════════════════════════════════
+    # 2. HERO HEADLINE + INTRO
+    # ════════════════════════════════════════════════════════════════
+    story.append(P(
+        '<font name="Helvetica-Bold" size="20">Is your site ready<br/>'
         f'for the <font color="#D93B1A"><i>AI search era?</i></font></font>',
-        sty(alignment=TA_LEFT, leading=28)
+        leading=26,
     ))
     story.append(Spacer(1, 3*mm))
-    story.append(Paragraph(
-        f'We audited <b>{domain}</b> the way ChatGPT, Perplexity, Gemini and Claude see it. '
-        + summary_short.replace("\n"," "),
-        sty(fontSize=8.5, leading=12)
+
+    # Intro: domain bold + first ~280 chars of summary
+    intro_text = safe(exec_summary)[:280].strip()
+    if len(exec_summary) > 280:
+        intro_text += "…"
+    story.append(P(
+        f'We audited <b>{safe(domain)}</b> the way ChatGPT, Perplexity, Gemini and Claude see it. '
+        + intro_text,
+        fontSize=8, leading=11,
     ))
     story.append(Spacer(1, 4*mm))
 
-    # ── Score block ──────────────────────────────────────────────────
-    score_col = W * 0.22
-    text_col  = W - score_col - 4*mm
-    score_data = [[
-        Paragraph(
-            f'<font name="Helvetica-Bold" size="52" color="#D93B1A">{avg}</font>'
-            f'<font name="Helvetica" size="20" color="#6B6B6B">/80</font>',
-            sty(alignment=TA_CENTER)
-        ),
-        Paragraph(
-            '<font name="Helvetica-Bold" size="11">AVERAGE PAGE SCORE<br/></font>'
-            '<font name="Helvetica-Bold" size="14">A solid foundation. A clear AI gap.</font>',
-            sty(leading=18)
-        )
-    ]]
-    st_ = Table(score_data, colWidths=[score_col, text_col])
-    st_.setStyle(TableStyle([
-        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-        ("BACKGROUND", (0,0), (-1,-1), SUMMIT_LIGHT_RL),
-        ("ROUNDEDCORNERS", [3]),
-        ("TOPPADDING", (0,0), (-1,-1), 8),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 8),
-        ("LEFTPADDING", (0,0), (-1,-1), 8),
-    ]))
-    story.append(st_)
-    story.append(Spacer(1, 4*mm))
+    # ════════════════════════════════════════════════════════════════
+    # 3. SCORE BOX  (score left | label + tagline right)
+    # ════════════════════════════════════════════════════════════════
+    SCORE_COL = 38*mm
+    TEXT_COL  = W - SCORE_COL
 
-    # ── Dimension scores row ─────────────────────────────────────────
+    score_markup = (
+        f'<font name="Helvetica-Bold" size="48" color="#D93B1A">{avg}</font>'
+        f'<font name="Helvetica" size="16" color="#6B6B6B">/80</font>'
+    )
+    label_markup = (
+        '<font name="Helvetica" size="7" color="#6B6B6B">AVERAGE PAGE SCORE</font><br/>'
+        '<font name="Helvetica-Bold" size="13" color="#1A1A1A">A solid foundation.</font><br/>'
+        '<font name="Helvetica-Bold" size="13" color="#D93B1A">A clear AI gap.</font>'
+    )
+
+    score_box = Table(
+        [[P(score_markup, alignment=TA_CENTER, leading=52),
+          P(label_markup, leading=17)]],
+        colWidths=[SCORE_COL, TEXT_COL],
+    )
+    score_box.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0), (-1,-1), LIGHT),
+        ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+        ("TOPPADDING",    (0,0), (-1,-1), 10),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 10),
+        ("LEFTPADDING",   (0,0), (0,0),   8),
+        ("LEFTPADDING",   (1,0), (1,0),   10),
+        ("RIGHTPADDING",  (0,0), (-1,-1), 8),
+    ]))
+    story.append(score_box)
+    story.append(Spacer(1, 3*mm))
+
+    # ════════════════════════════════════════════════════════════════
+    # 4. DIMENSION BADGES ROW
+    # ════════════════════════════════════════════════════════════════
     cell_w = W / 8
-    dim_row = []
+    dim_cells = []
     for dk, dl in zip(dim_keys, dim_labels):
         s = dim_avg.get(dk, 0)
-        c = colors.HexColor(score_color(s))
-        dim_row.append(
-            Paragraph(
-                f'<font name="Helvetica" size="6" color="#FFFFFF">{dl}<br/></font>'
-                f'<font name="Helvetica-Bold" size="14" color="#FFFFFF">{s}</font>'
-                f'<font name="Helvetica" size="8" color="#FFFFFF">/10</font>',
-                sty(alignment=TA_CENTER, leading=11)
-            )
-        )
-    dim_t = Table([dim_row], colWidths=[cell_w]*8)
-    dim_styles = [("TOPPADDING",(0,0),(-1,-1),6),("BOTTOMPADDING",(0,0),(-1,-1),6)]
+        dim_cells.append(P(
+            f'<font name="Helvetica" size="5.5" color="#FFFFFF">{dl}<br/></font>'
+            f'<font name="Helvetica-Bold" size="13" color="#FFFFFF">{s}</font>'
+            f'<font name="Helvetica" size="7" color="#FFFFFF">/10</font>',
+            alignment=TA_CENTER, leading=10,
+        ))
+
+    dim_t = Table([dim_cells], colWidths=[cell_w]*8)
+    dim_styles = [
+        ("TOPPADDING",    (0,0), (-1,-1), 6),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 6),
+        ("LEFTPADDING",   (0,0), (-1,-1), 1),
+        ("RIGHTPADDING",  (0,0), (-1,-1), 1),
+    ]
     for i, dk in enumerate(dim_keys):
-        s = dim_avg.get(dk, 0)
-        c = colors.HexColor(score_color(s))
-        dim_styles.append(("BACKGROUND",(i,0),(i,0), c))
+        dim_styles.append(("BACKGROUND", (i,0), (i,0), dim_color(dim_avg.get(dk,0))))
     dim_t.setStyle(TableStyle(dim_styles))
     story.append(dim_t)
     story.append(Spacer(1, 5*mm))
 
-    # ── What's working / holding back ───────────────────────────────
-    half = (W - 6*mm) / 2
+    # ════════════════════════════════════════════════════════════════
+    # 5. WHAT'S WORKING / HOLDING YOU BACK
+    #    Two independent tables placed side-by-side via a wrapper table
+    #    Key fix: build each side as a list of Paragraphs, NOT nested Tables
+    # ════════════════════════════════════════════════════════════════
+    GAP   = 5*mm
+    HALF  = (W - GAP) / 2
 
-    def bullet_rows(items, icon, icon_color):
+    def build_side(items, hdr_text, hdr_color, icon, icon_color_hex):
+        """Returns a Table for one side (working or holding)."""
         rows = []
-        for it in items:
-            pt  = it.get("point","")
-            det = it.get("detail","")
+        # Header
+        rows.append([
+            P(f'<font name="Helvetica-Bold" size="8.5" color="#FFFFFF">{hdr_text}</font>',
+              leading=11),
+        ])
+        # Up to 3 bullet rows
+        for it in items[:3]:
+            pt  = safe(it.get("point",""))
+            det = safe(it.get("detail",""))
             rows.append([
-                Paragraph(f'<font color="{icon_color}" name="Helvetica-Bold" size="11">{icon}</font>',
-                          sty(alignment=TA_CENTER)),
-                Paragraph(f'<b>{pt}</b><br/><font size="7.5">{det}</font>', sty(fontSize=8, leading=11))
+                P(
+                    f'<font name="Helvetica-Bold" size="8" color="{icon_color_hex}">{icon} </font>'
+                    f'<font name="Helvetica-Bold" size="8">{pt}</font><br/>'
+                    f'<font name="Helvetica" size="7" color="#4A4A4A">{det}</font>',
+                    leading=11,
+                ),
             ])
-        return rows
+        # Pad to 3 rows so both sides same height
+        while len(rows) < 4:
+            rows.append([P(" ", fontSize=7)])
 
-    working_rows = bullet_rows(working, "✚", "#27AE60")
-    holding_rows = bullet_rows(holding, "!", "#D93B1A")
-
-    def side_table(rows, header):
-        data = [[Paragraph(f'<font name="Helvetica-Bold" size="9" color="#FFFFFF">{header}</font>',
-                           sty(alignment=TA_LEFT))]] + rows
-        t = Table(data, colWidths=[8*mm, half - 8*mm])
-        bg = "#27AE60" if "WORKING" in header else "#D93B1A"
+        t = Table(rows, colWidths=[HALF])
         ts = [
-            ("BACKGROUND",(0,0),(-1,0), colors.HexColor(bg)),
-            ("SPAN",(0,0),(-1,0)),
-            ("TOPPADDING",(0,0),(-1,-1),4),
-            ("BOTTOMPADDING",(0,0),(-1,-1),4),
-            ("LEFTPADDING",(0,0),(-1,-1),5),
-            ("VALIGN",(0,0),(-1,-1),"TOP"),
-            ("LINEBELOW",(0,0),(-1,-1),0.3, colors.HexColor("#DDDDDD")),
+            # Header row bg
+            ("BACKGROUND",    (0,0), (-1,0),  hdr_color),
+            ("TOPPADDING",    (0,0), (-1,-1),  5),
+            ("BOTTOMPADDING", (0,0), (-1,-1),  5),
+            ("LEFTPADDING",   (0,0), (-1,-1),  7),
+            ("RIGHTPADDING",  (0,0), (-1,-1),  7),
+            ("VALIGN",        (0,0), (-1,-1),  "TOP"),
+            # Light bg on content rows
+            ("BACKGROUND",    (0,1), (-1,-1),  colors.HexColor("#F9F9F9")),
+            # Divider lines between content rows
+            ("LINEBELOW",     (0,1), (-1,-2),  0.4, colors.HexColor("#E0E0E0")),
         ]
         t.setStyle(TableStyle(ts))
         return t
 
-    two_col = Table([[side_table(working_rows,"✚ WHAT'S WORKING"),
-                      side_table(holding_rows,"! WHAT'S HOLDING YOU BACK")]],
-                    colWidths=[half, half], hAlign="LEFT")
-    two_col.setStyle(TableStyle([("LEFTPADDING",(0,0),(-1,-1),0),
-                                  ("RIGHTPADDING",(0,0),(-1,-1),6),]))
-    story.append(two_col)
-    story.append(Spacer(1, 5*mm))
+    working_t = build_side(working, "\u271a WHAT\u2019S WORKING",    GREEN, "\u271a", "#27AE60")
+    holding_t = build_side(holding, "! WHAT\u2019S HOLDING YOU BACK", RED,   "!",     "#D93B1A")
 
-    # ── Three quick wins ─────────────────────────────────────────────
-    story.append(HRFlowable(width=W, thickness=0.5, color=SUMMIT_LIGHT_RL))
-    story.append(Spacer(1, 2*mm))
-    story.append(Paragraph(
-        '<font name="Helvetica" size="7" color="#6B6B6B">THREE MOVES THAT MOVE THE NEEDLE</font><br/>'
-        '<font name="Helvetica-Bold" size="14">Quick wins, big impact</font>',
-        sty(leading=18)
+    sides = Table(
+        [[working_t, Spacer(GAP, 1), holding_t]],
+        colWidths=[HALF, GAP, HALF],
+    )
+    sides.setStyle(TableStyle([
+        ("VALIGN",       (0,0), (-1,-1), "TOP"),
+        ("LEFTPADDING",  (0,0), (-1,-1), 0),
+        ("RIGHTPADDING", (0,0), (-1,-1), 0),
+        ("TOPPADDING",   (0,0), (-1,-1), 0),
+        ("BOTTOMPADDING",(0,0), (-1,-1), 0),
+    ]))
+    story.append(sides)
+    story.append(Spacer(1, 6*mm))
+
+    # ════════════════════════════════════════════════════════════════
+    # 6. THREE QUICK WINS
+    # ════════════════════════════════════════════════════════════════
+    story.append(HRFlowable(width=W, thickness=0.5, color=colors.HexColor("#DDDDDD"), spaceAfter=4))
+    story.append(P(
+        '<font name="Helvetica" size="6.5" color="#6B6B6B">THREE MOVES THAT MOVE THE NEEDLE</font>',
+        leading=9,
     ))
-    story.append(Spacer(1, 3*mm))
+    story.append(P(
+        '<font name="Helvetica-Bold" size="13">Quick wins, big impact</font>',
+        leading=17,
+    ))
+    story.append(Spacer(1, 4*mm))
 
-    third = W / 3
-    win_data = []
-    win_cells = []
-    for w in wins[:3]:
-        win_cells.append(
-            Paragraph(
-                f'<font name="Helvetica-Bold" size="28" color="#D93B1A">{w.get("number","")}</font><br/>'
-                f'<font name="Helvetica-Bold" size="9">{w.get("title","")}</font><br/>'
-                f'<font name="Helvetica" size="8">{w.get("detail","")}</font>',
-                sty(leading=12)
+    THIRD = W / 3
+    win_rows = []
+    for w in wins:
+        num    = safe(w.get("number",""))
+        title  = safe(w.get("title",""))
+        detail = safe(w.get("detail",""))
+        win_rows.append(
+            P(
+                f'<font name="Helvetica-Bold" size="26" color="#D93B1A">{num}</font><br/>'
+                f'<font name="Helvetica-Bold" size="8.5">{title}</font><br/>'
+                f'<font name="Helvetica" size="7.5" color="#4A4A4A">{detail}</font>',
+                leading=13,
             )
         )
-    if win_cells:
-        wins_t = Table([win_cells], colWidths=[third]*3)
-        wins_t.setStyle(TableStyle([
-            ("VALIGN",(0,0),(-1,-1),"TOP"),
-            ("TOPPADDING",(0,0),(-1,-1),0),
-            ("LEFTPADDING",(1,0),(-1,-1),8),
-            ("LINEAFTER",(0,0),(1,-1),0.5,SUMMIT_LIGHT_RL),
-        ]))
-        story.append(wins_t)
+    # Pad to 3
+    while len(win_rows) < 3:
+        win_rows.append(P(" "))
 
-    story.append(Spacer(1, 5*mm))
+    wins_t = Table([win_rows], colWidths=[THIRD]*3)
+    wins_t.setStyle(TableStyle([
+        ("VALIGN",        (0,0), (-1,-1), "TOP"),
+        ("TOPPADDING",    (0,0), (-1,-1), 0),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 0),
+        ("LEFTPADDING",   (0,0), (0,0),   0),
+        ("LEFTPADDING",   (1,0), (-1,-1), 8),
+        ("RIGHTPADDING",  (0,0), (-1,-1), 8),
+        ("LINEAFTER",     (0,0), (1,-1),  0.5, colors.HexColor("#DDDDDD")),
+    ]))
+    story.append(wins_t)
+    story.append(Spacer(1, 6*mm))
 
-    # ── CTA footer ───────────────────────────────────────────────────
-    cta_data = [[
-        Paragraph(
-            f'<font name="Helvetica-Bold" size="10">We\'ll walk your team through<br/>'
-            f'every finding. <font color="#D93B1A"><i>No obligation.</i></font></font>',
-            sty()
-        ),
-        Paragraph(
-            '<font name="Helvetica" size="7" color="#6B6B6B">BOOK A SESSION<br/></font>'
-            '<font name="Helvetica-Bold" size="11">hello@summitmedia.com</font>',
-            sty(alignment=TA_CENTER)
-        )
-    ]]
-    cta_t = Table(cta_data, colWidths=[W*0.55, W*0.45])
+    # ════════════════════════════════════════════════════════════════
+    # 7. CTA BAR
+    # ════════════════════════════════════════════════════════════════
+    cta_left = P(
+        '<font name="Helvetica-Bold" size="10">We\u2019ll walk your team through<br/>'
+        'every finding. <font color="#D93B1A"><i>No obligation.</i></font></font>',
+        leading=14,
+    )
+    cta_right = P(
+        '<font name="Helvetica" size="6.5" color="#6B6B6B">BOOK A SESSION<br/></font>'
+        '<font name="Helvetica-Bold" size="10.5">hello@summitmedia.com</font>',
+        alignment=TA_CENTER, leading=13,
+    )
+    cta_t = Table([[cta_left, cta_right]], colWidths=[W*0.52, W*0.48])
     cta_t.setStyle(TableStyle([
-        ("BACKGROUND",(1,0),(1,0), SUMMIT_LIGHT_RL),
-        ("TOPPADDING",(0,0),(-1,-1),8),
-        ("BOTTOMPADDING",(0,0),(-1,-1),8),
-        ("LEFTPADDING",(0,0),(-1,-1),8),
-        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
-        ("LINEABOVE",(0,0),(-1,0),2,SUMMIT_RED_RL),
+        ("BACKGROUND",    (1,0), (1,0),  LIGHT),
+        ("TOPPADDING",    (0,0), (-1,-1), 9),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 9),
+        ("LEFTPADDING",   (0,0), (0,0),   10),
+        ("LEFTPADDING",   (1,0), (1,0),   8),
+        ("RIGHTPADDING",  (0,0), (-1,-1), 8),
+        ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+        ("LINEABOVE",     (0,0), (-1,0),  2, RED),
     ]))
     story.append(cta_t)
-
-    # ── Footer bar ───────────────────────────────────────────────────
     story.append(Spacer(1, 3*mm))
-    story.append(Paragraph(
-        '<font name="Helvetica" size="7" color="#6B6B6B">'
-        'SUMMITMEDIA.CO.UK &nbsp;&nbsp;&nbsp; PREPARED BY SUMMIT · AI VISIBILITY PRACTICE'
+
+    # ════════════════════════════════════════════════════════════════
+    # 8. FOOTER TEXT
+    # ════════════════════════════════════════════════════════════════
+    story.append(P(
+        '<font name="Helvetica" size="6.5" color="#6B6B6B">'
+        'SUMMITMEDIA.CO.UK &nbsp;&nbsp;&nbsp;&nbsp; '
+        'PREPARED BY SUMMIT &middot; AI VISIBILITY PRACTICE'
         '</font>',
-        sty(alignment=TA_CENTER)
+        alignment=TA_CENTER, leading=9,
     ))
 
     doc.build(story)
     return buf.getvalue()
+
+
 
 
 # ─── Streamlit UI ─────────────────────────────────────────────────────────────
