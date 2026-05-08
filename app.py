@@ -46,7 +46,7 @@ def get_gemini_client():
         st.error("GEMINI_API_KEY not found. Add it to Streamlit secrets.")
         st.stop()
     genai.configure(api_key=api_key)
-    return genai.GenerativeModel("gemini-2.5-flash")
+    return genai.GenerativeModel("gemini-2.5-flash-preview-05-20")
 
 # ─── Fetch URL HTML ───────────────────────────────────────────────────────────
 def fetch_pages(domain: str, extra_urls: list[str]) -> dict[str, str]:
@@ -147,9 +147,18 @@ Return ONLY valid JSON in exactly this structure:
     {"point": "string", "detail": "string"}
   ],
   "whats_holding_back": [
+    {"point": "string", "detail": "string"},
+    {"point": "string", "detail": "string"},
     {"point": "string", "detail": "string"}
   ]
 }
+
+IMPORTANT: The "recommendations" array MUST contain 8-12 items ranked by impact. Every audit has recommendations.
+Use priority P1 for highest impact quick wins, P2 for this quarter, P3 for backlog.
+Example recommendation format:
+{"priority": "P1", "action": "Ship Organization + WebSite JSON-LD sitewide", "impact": "Very high - foundation for all AI citation", "effort": "Low - single template insert", "owner": "Dev"}
+
+The "whats_working" and "whats_holding_back" arrays MUST each contain exactly 3 items.
 """
 
 def clean_json_string(raw: str) -> str:
@@ -203,7 +212,7 @@ def run_audit(model, pages: dict) -> dict:
     raw = clean_json_string(response.text)
 
     try:
-        return repair_and_parse(raw)
+        result = repair_and_parse(raw)
     except ValueError:
         # Retry: ask Gemini to fix its own output
         fix_prompt = (
@@ -216,7 +225,65 @@ def run_audit(model, pages: dict) -> dict:
             generation_config={"temperature": 0.0, "max_output_tokens": 8192},
         )
         raw2 = clean_json_string(retry.text)
-        return repair_and_parse(raw2)
+        result = repair_and_parse(raw2)
+
+    # ── Post-process: fill missing recommendations from page findings ──────
+    if not result.get("recommendations"):
+        recs = []
+        dim_keys = ["aria","schema","headings","meta","links","alt_text","crawl","llm"]
+        dim_labels = ["ARIA","SCHEMA","HEADINGS","META","LINKS","ALT TEXT","CRAWL","LLM"]
+        action_map = {
+            "schema":   ("Ship schema.org JSON-LD structured data sitewide",
+                         "Very high — biggest single AI citation unlock", "Low — template insert", "Dev"),
+            "aria":     ("Add ARIA landmark roles to navigation and content regions",
+                         "Medium — improves AI page structure parsing", "Low — template tweak", "Dev"),
+            "alt_text": ("Audit and fix all image alt attributes",
+                         "High — dual accessibility and AI win", "Low — CMS field fix", "Content"),
+            "headings": ("Ensure every page has a unique, descriptive H1",
+                         "High — primary topic signal for AI crawlers", "Low — template fix", "Dev"),
+            "links":    ("Normalise internal links to consistent https:// protocol",
+                         "Medium — removes redirect noise for crawlers", "Medium — site-wide pass", "Dev"),
+            "meta":     ("Add bespoke meta description to every page",
+                         "Medium — strengthens per-page topic signal", "Low — content pass", "Content"),
+            "crawl":    ("Audit JS-dependent content and ensure static HTML fallbacks",
+                         "High — critical for AI crawler access", "High — architecture review", "Dev"),
+            "llm":      ("Add named experts, dates and first-hand detail to key pages",
+                         "High — converts pages into citable authority content", "Medium — content pass", "Content"),
+        }
+        # Find lowest-scoring dimensions across all pages
+        avg_scores = result.get("dimension_averages", {})
+        sorted_dims = sorted(dim_keys, key=lambda k: avg_scores.get(k, 10))
+        priority_map = ["P1","P1","P2","P2","P2","P3","P3","P3"]
+        for i, dk in enumerate(sorted_dims):
+            if dk in action_map:
+                action, impact, effort, owner = action_map[dk]
+                recs.append({
+                    "priority": priority_map[i],
+                    "action": action,
+                    "impact": impact,
+                    "effort": effort,
+                    "owner": owner,
+                })
+        result["recommendations"] = recs
+
+    # Fill whats_working / whats_holding_back if empty
+    if not result.get("whats_working"):
+        result["whats_working"] = [
+            {"point": "Review audit details", "detail": "See per-page dimension breakdown for strengths."}
+        ]
+    if not result.get("whats_holding_back"):
+        dim_keys = ["aria","schema","headings","meta","links","alt_text","crawl","llm"]
+        avg_scores = result.get("dimension_averages", {})
+        worst = sorted(dim_keys, key=lambda k: avg_scores.get(k, 10))[:3]
+        labels = {"aria":"ARIA","schema":"Schema","headings":"Headings","meta":"Meta",
+                  "links":"Links","alt_text":"Alt Text","crawl":"Crawl","llm":"LLM content"}
+        result["whats_holding_back"] = [
+            {"point": f"{labels.get(dk,'Unknown')} gap",
+             "detail": f"Scoring {avg_scores.get(dk,0)}/10 — a priority improvement area."}
+            for dk in worst
+        ]
+
+    return result
 
 # ─── Score colour ─────────────────────────────────────────────────────────────
 def score_color(s):
@@ -968,6 +1035,9 @@ st.markdown(f"""
   .stButton > button {{ background: {SUMMIT_RED}; color: white; border: none;
     border-radius: 6px; font-weight: 600; padding: 0.6rem 1.4rem; }}
   .stButton > button:hover {{ background: #b83015; }}
+  .stDownloadButton > button {{ background: {SUMMIT_RED}; color: white; border: none;
+    border-radius: 6px; font-weight: 600; }}
+  .stDownloadButton > button:hover {{ background: #b83015; }}
 </style>
 <div class="summit-header">
   <h1>🔍 Summit · AI Visibility Audit Tool</h1>
@@ -988,6 +1058,7 @@ extra_urls = [u for u in extra_raw.strip().splitlines() if u.strip()]
 
 run = st.button("🚀 Run Audit", use_container_width=True)
 
+# ── Run audit and store everything in session_state ────────────────────────
 if run:
     if not domain:
         st.error("Please enter a domain.")
@@ -1000,17 +1071,44 @@ if run:
 
     st.success(f"Fetched {len(pages)} page(s). Running Gemini audit…")
 
-    with st.spinner("Analysing with Gemini…"):
+    with st.spinner("Analysing with Gemini — this takes 20–40 seconds…"):
         try:
             audit = run_audit(model, pages)
         except Exception as e:
             st.error(f"Gemini audit failed: {e}")
             st.stop()
 
-    # ── Display results ────────────────────────────────────────────────────
-    company = audit.get("company_name", domain)
-    avg     = audit.get("average_score", 0)
-    dim_avg = audit.get("dimension_averages", {})
+    # Pre-generate both files while we have the data
+    with st.spinner("Building Word document…"):
+        try:
+            docx_bytes = build_docx(audit, month_year)
+        except Exception as e:
+            docx_bytes = None
+            st.warning(f"Word doc error: {e}")
+
+    with st.spinner("Building one-pager PDF…"):
+        try:
+            pdf_bytes = build_onepager(audit, month_year)
+        except Exception as e:
+            pdf_bytes = None
+            st.warning(f"PDF error: {e}")
+
+    # Store everything — survives download-button reruns
+    st.session_state["audit"]      = audit
+    st.session_state["month_year"] = month_year
+    st.session_state["docx_bytes"] = docx_bytes
+    st.session_state["pdf_bytes"]  = pdf_bytes
+
+# ── Display results from session_state (persists across reruns) ────────────
+if "audit" in st.session_state:
+    audit      = st.session_state["audit"]
+    month_year = st.session_state["month_year"]
+    docx_bytes = st.session_state["docx_bytes"]
+    pdf_bytes  = st.session_state["pdf_bytes"]
+
+    company  = audit.get("company_name", domain)
+    avg      = audit.get("average_score", 0)
+    dim_avg  = audit.get("dimension_averages", {})
     dim_keys   = ["aria","schema","headings","meta","links","alt_text","crawl","llm"]
     dim_labels = ["ARIA","SCHEMA","HEADINGS","META","LINKS","ALT TEXT","CRAWL","LLM"]
 
@@ -1066,35 +1164,43 @@ if run:
             "Owner": r.get("owner",""),
         } for r in recs])
 
-    # ── Generate documents ─────────────────────────────────────────────────
+    # ── Download buttons — data already in memory, no recompute ───────────
     st.markdown("---")
     st.markdown("### 📥 Download Outputs")
     col_d, col_p = st.columns(2)
 
+    slug = company.lower().replace(' ', '-').replace('.', '')
+
     with col_d:
-        with st.spinner("Building Word document…"):
-            try:
-                docx_bytes = build_docx(audit, month_year)
-                st.download_button(
-                    "⬇️ Download Full Audit (.docx)",
-                    data=docx_bytes,
-                    file_name=f"summit-ai-audit-{company.lower().replace(' ','-')}.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    use_container_width=True,
-                )
-            except Exception as e:
-                st.error(f"Word doc error: {e}")
+        if docx_bytes:
+            st.download_button(
+                "⬇️ Download Full Audit (.docx)",
+                data=docx_bytes,
+                file_name=f"summit-ai-audit-{slug}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True,
+                key="dl_docx",
+            )
+        else:
+            st.error("Word document could not be generated.")
 
     with col_p:
-        with st.spinner("Building one-pager PDF…"):
-            try:
-                pdf_bytes = build_onepager(audit, month_year)
-                st.download_button(
-                    "⬇️ Download One-Pager (.pdf)",
-                    data=pdf_bytes,
-                    file_name=f"summit-ai-snapshot-{company.lower().replace(' ','-')}.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
-                )
-            except Exception as e:
-                st.error(f"PDF error: {e}")
+        if pdf_bytes:
+            st.download_button(
+                "⬇️ Download One-Pager (.pdf)",
+                data=pdf_bytes,
+                file_name=f"summit-ai-snapshot-{slug}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                key="dl_pdf",
+            )
+        else:
+            st.error("PDF could not be generated.")
+
+    # Clear results button
+    st.markdown("<br>", unsafe_allow_html=True)
+    if st.button("🗑️ Clear & run new audit"):
+        for k in ["audit","month_year","docx_bytes","pdf_bytes"]:
+            st.session_state.pop(k, None)
+        st.rerun()
+
