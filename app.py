@@ -46,7 +46,7 @@ def get_gemini_client():
         st.error("GEMINI_API_KEY not found. Add it to Streamlit secrets.")
         st.stop()
     genai.configure(api_key=api_key)
-    return genai.GenerativeModel("gemini-2.5-flash")
+    return genai.GenerativeModel("gemini-2.0-flash")
 
 # ─── Fetch URL HTML ───────────────────────────────────────────────────────────
 def fetch_pages(domain: str, extra_urls: list[str]) -> dict[str, str]:
@@ -226,423 +226,385 @@ def score_color(s):
 
 # ─── Build Word doc ───────────────────────────────────────────────────────────
 def build_docx(data: dict, month_year: str) -> bytes:
-    """Write a Node.js docx-generating script and run it."""
-    company  = data.get("company_name", "Client")
-    domain   = data.get("domain", "")
-    avg      = data.get("average_score", 0)
-    dim_avg  = data.get("dimension_averages", {})
-    pages    = data.get("pages", [])
-    themes   = data.get("cross_cutting_themes", [])
-    recs     = data.get("recommendations", [])
-    summary  = data.get("executive_summary", "")
+    """
+    Writes audit data to a JSON file, then runs a static Node.js script
+    that reads the JSON. This avoids injecting any user/LLM content into
+    JS source code, which was causing SyntaxErrors.
+    """
+    import tempfile, os, subprocess, json as _json
 
-    # Escape strings for JS
-    def js(s):
-        return json.dumps(str(s))
-
-    dim_labels = ["ARIA","SCHEMA","HEADINGS","META","LINKS","ALT TEXT","CRAWL","LLM"]
     dim_keys   = ["aria","schema","headings","meta","links","alt_text","crawl","llm"]
+    dim_labels = ["ARIA","SCHEMA","HEADINGS","META","LINKS","ALT TEXT","CRAWL","LLM"]
 
     def score_color_hex(s):
         if s <= 2: return "C0392B"
         if s <= 5: return "E67E22"
         return "27AE60"
 
-    # Build page sections JS
-    page_sections_js = ""
-    for i, p in enumerate(pages, 1):
-        url     = p.get("url","")
-        title   = p.get("title", f"Page {i}")
-        pscore  = p.get("score", 0)
-        verdict = p.get("verdict","")
-        hf      = p.get("headline_finding","")
-        dims    = p.get("dimensions", {})
-        sfinds  = p.get("specific_findings", [])
+    # Enrich data with derived fields the JS needs
+    enriched = _json.loads(_json.dumps(data))   # deep copy via json
+    enriched["month_year"]   = month_year
+    enriched["logo_path"]    = LOGO_PATH
+    enriched["dim_keys"]     = dim_keys
+    enriched["dim_labels"]   = dim_labels
+    # Add colour fields
+    dim_avg = enriched.get("dimension_averages", {})
+    enriched["dim_colors"] = {k: score_color_hex(dim_avg.get(k, 0)) for k in dim_keys}
+    for page in enriched.get("pages", []):
+        dims = page.get("dimensions", {})
+        page["dim_colors"] = {k: score_color_hex(dims.get(k, {}).get("score", 0)) for k in dim_keys}
+        page["score_color"] = score_color_hex(page.get("score", 0))
 
-        # dimension table rows
-        dim_rows_js = ""
-        for dk, dl in zip(dim_keys, dim_labels):
-            d = dims.get(dk, {})
-            s = d.get("score", 0)
-            det = d.get("detail","")
-            col = score_color_hex(s)
-            dim_rows_js += f"""
-      new TableRow({{ children: [
-        new TableCell({{ borders, width: {{ size: 1200, type: WidthType.DXA }},
-          shading: {{ fill: "{col}", type: ShadingType.CLEAR }},
-          margins: {{ top:80, bottom:80, left:120, right:120 }},
-          children: [new Paragraph({{ children: [new TextRun({{ text: {js(dl)}, bold: true, color: "FFFFFF", font: "Arial", size: 18 }})] }})] }}),
-        new TableCell({{ borders, width: {{ size: 600, type: WidthType.DXA }},
-          margins: {{ top:80, bottom:80, left:120, right:120 }},
-          children: [new Paragraph({{ alignment: AlignmentType.CENTER, children: [new TextRun({{ text: {js(str(s)+"/10")}, bold: true, font: "Arial", size: 20 }})] }})] }}),
-        new TableCell({{ borders, width: {{ size: 7160, type: WidthType.DXA }},
-          margins: {{ top:80, bottom:80, left:120, right:120 }},
-          children: [new Paragraph({{ children: [new TextRun({{ text: {js(det)}, font: "Arial", size: 18 }})] }})] }}),
-      ]}})"""
+    # Write data JSON to temp file
+    data_file = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    _json.dump(enriched, data_file, ensure_ascii=True)
+    data_file.close()
 
-        # specific findings
-        sf_js = ""
-        for sf in sfinds:
-            sf_js += f"""
-      new Paragraph({{ numbering: {{ reference: "bullets", level: 0 }},
-        children: [new TextRun({{ text: {js(sf)}, font: "Arial", size: 20 }})] }}),"""
+    out_file = "/tmp/audit_output.docx"
 
-        page_sections_js += f"""
-    // ── Page {i} ──
-    new Paragraph({{ heading: HeadingLevel.HEADING_1,
-      children: [new TextRun({{ text: {js(f"PAGE {i}: {title.upper()}")}, font: "Arial", size: 28, bold: true, color: "D93B1A" }})] }}),
-    new Paragraph({{ children: [new TextRun({{ text: "URL: ", bold: true, font: "Arial", size: 20 }}),
-      new TextRun({{ text: {js(url)}, font: "Arial", size: 20, color: "D93B1A" }})] }}),
-    new Paragraph({{ children: [new TextRun({{ text: {js(f"Total score: {pscore}/80")}, bold: true, font: "Arial", size: 20 }})] }}),
-    new Paragraph({{ spacing: {{ before: 160 }},
-      border: {{ left: {{ style: BorderStyle.SINGLE, size: 20, color: "D93B1A" }} }},
-      indent: {{ left: 360 }},
-      children: [new TextRun({{ text: {js(hf)}, font: "Arial", size: 20, italics: true }})] }}),
-    new Paragraph({{ heading: HeadingLevel.HEADING_2,
-      children: [new TextRun({{ text: "Dimension Breakdown", font: "Arial", size: 24, bold: true }})] }}),
-    new Table({{
-      width: {{ size: 8960, type: WidthType.DXA }},
-      columnWidths: [1200, 600, 7160],
-      rows: [{dim_rows_js}
-      ]
-    }}),
-    new Paragraph({{ heading: HeadingLevel.HEADING_2,
-      children: [new TextRun({{ text: "Specific Findings", font: "Arial", size: 24, bold: true }})] }}),
-    {sf_js if sf_js else "new Paragraph({ children: [new TextRun({ text: 'No specific findings recorded.', font: 'Arial', size: 20 })] }),"}
-    new Paragraph({{ children: [new PageBreak()] }}),"""
-
-    # Cross-cutting themes JS
-    themes_js = ""
-    for t in themes:
-        title_t = t.get("title","")
-        detail_t = t.get("detail","")
-        themes_js += f"""
-    new Paragraph({{ heading: HeadingLevel.HEADING_2,
-      children: [new TextRun({{ text: {js(title_t)}, font: "Arial", size: 24, bold: true }})] }}),
-    new Paragraph({{ spacing: {{ before: 80, after: 160 }},
-      children: [new TextRun({{ text: {js(detail_t)}, font: "Arial", size: 20 }})] }}),"""
-
-    # Recommendations table rows JS
-    rec_rows_js = """
-      new TableRow({ tableHeader: true, children: [
-        new TableCell({ borders, shading: { fill: "D93B1A", type: ShadingType.CLEAR },
-          width: { size: 600, type: WidthType.DXA },
-          margins: { top:80, bottom:80, left:120, right:120 },
-          children: [new Paragraph({ children: [new TextRun({ text: "PRI.", bold: true, color: "FFFFFF", font: "Arial", size: 18 })] })] }),
-        new TableCell({ borders, shading: { fill: "D93B1A", type: ShadingType.CLEAR },
-          width: { size: 4200, type: WidthType.DXA },
-          margins: { top:80, bottom:80, left:120, right:120 },
-          children: [new Paragraph({ children: [new TextRun({ text: "ACTION", bold: true, color: "FFFFFF", font: "Arial", size: 18 })] })] }),
-        new TableCell({ borders, shading: { fill: "D93B1A", type: ShadingType.CLEAR },
-          width: { size: 1800, type: WidthType.DXA },
-          margins: { top:80, bottom:80, left:120, right:120 },
-          children: [new Paragraph({ children: [new TextRun({ text: "IMPACT", bold: true, color: "FFFFFF", font: "Arial", size: 18 })] })] }),
-        new TableCell({ borders, shading: { fill: "D93B1A", type: ShadingType.CLEAR },
-          width: { size: 1500, type: WidthType.DXA },
-          margins: { top:80, bottom:80, left:120, right:120 },
-          children: [new Paragraph({ children: [new TextRun({ text: "EFFORT", bold: true, color: "FFFFFF", font: "Arial", size: 18 })] })] }),
-        new TableCell({ borders, shading: { fill: "D93B1A", type: ShadingType.CLEAR },
-          width: { size: 1220, type: WidthType.DXA },
-          margins: { top:80, bottom:80, left:120, right:120 },
-          children: [new Paragraph({ children: [new TextRun({ text: "OWNER", bold: true, color: "FFFFFF", font: "Arial", size: 18 })] })] }),
-      ]}),"""
-
-    for i, r in enumerate(recs):
-        row_fill = "F5F4F2" if i % 2 == 0 else "FFFFFF"
-        rec_rows_js += f"""
-      new TableRow({{ children: [
-        new TableCell({{ borders, shading: {{ fill: {js(row_fill)}, type: ShadingType.CLEAR }},
-          width: {{ size: 600, type: WidthType.DXA }},
-          margins: {{ top:80, bottom:80, left:120, right:120 }},
-          children: [new Paragraph({{ children: [new TextRun({{ text: {js(r.get("priority",""))}, bold: true, font: "Arial", size: 18, color: "D93B1A" }})] }})] }}),
-        new TableCell({{ borders, shading: {{ fill: {js(row_fill)}, type: ShadingType.CLEAR }},
-          width: {{ size: 4200, type: WidthType.DXA }},
-          margins: {{ top:80, bottom:80, left:120, right:120 }},
-          children: [new Paragraph({{ children: [new TextRun({{ text: {js(r.get("action",""))}, font: "Arial", size: 18 }})] }})] }}),
-        new TableCell({{ borders, shading: {{ fill: {js(row_fill)}, type: ShadingType.CLEAR }},
-          width: {{ size: 1800, type: WidthType.DXA }},
-          margins: {{ top:80, bottom:80, left:120, right:120 }},
-          children: [new Paragraph({{ children: [new TextRun({{ text: {js(r.get("impact",""))}, font: "Arial", size: 18 }})] }})] }}),
-        new TableCell({{ borders, shading: {{ fill: {js(row_fill)}, type: ShadingType.CLEAR }},
-          width: {{ size: 1500, type: WidthType.DXA }},
-          margins: {{ top:80, bottom:80, left:120, right:120 }},
-          children: [new Paragraph({{ children: [new TextRun({{ text: {js(r.get("effort",""))}, font: "Arial", size: 18 }})] }})] }}),
-        new TableCell({{ borders, shading: {{ fill: {js(row_fill)}, type: ShadingType.CLEAR }},
-          width: {{ size: 1220, type: WidthType.DXA }},
-          margins: {{ top:80, bottom:80, left:120, right:120 }},
-          children: [new Paragraph({{ children: [new TextRun({{ text: {js(r.get("owner",""))}, font: "Arial", size: 18 }})] }})] }}),
-      ] }}),"""
-
-    # Scorecard table rows JS
-    scorecard_rows_js = """
-      new TableRow({ tableHeader: true, children: [
-        new TableCell({ borders, shading: { fill: "D93B1A", type: ShadingType.CLEAR },
-          width: { size: 3500, type: WidthType.DXA }, margins: { top:80, bottom:80, left:120, right:120 },
-          children: [new Paragraph({ children: [new TextRun({ text: "PAGE", bold: true, color: "FFFFFF", font: "Arial", size: 18 })] })] }),
-        new TableCell({ borders, shading: { fill: "D93B1A", type: ShadingType.CLEAR },
-          width: { size: 900, type: WidthType.DXA }, margins: { top:80, bottom:80, left:120, right:120 },
-          children: [new Paragraph({ children: [new TextRun({ text: "SCORE", bold: true, color: "FFFFFF", font: "Arial", size: 18 })] })] }),
-        new TableCell({ borders, shading: { fill: "D93B1A", type: ShadingType.CLEAR },
-          width: { size: 4960, type: WidthType.DXA }, margins: { top:80, bottom:80, left:120, right:120 },
-          children: [new Paragraph({ children: [new TextRun({ text: "VERDICT", bold: true, color: "FFFFFF", font: "Arial", size: 18 })] })] }),
-      ]}),"""
-
-    for i, p in enumerate(pages):
-        row_fill = "F5F4F2" if i % 2 == 0 else "FFFFFF"
-        scorecard_rows_js += f"""
-      new TableRow({{ children: [
-        new TableCell({{ borders, shading: {{ fill: {js(row_fill)}, type: ShadingType.CLEAR }},
-          width: {{ size: 3500, type: WidthType.DXA }}, margins: {{ top:80, bottom:80, left:120, right:120 }},
-          children: [new Paragraph({{ children: [new TextRun({{ text: {js(p.get("title",""))}, bold: true, font: "Arial", size: 18 }})] }})] }}),
-        new TableCell({{ borders, shading: {{ fill: {js(row_fill)}, type: ShadingType.CLEAR }},
-          width: {{ size: 900, type: WidthType.DXA }}, margins: {{ top:80, bottom:80, left:120, right:120 }},
-          children: [new Paragraph({{ alignment: AlignmentType.CENTER, children: [new TextRun({{ text: {js(str(p.get("score",0))+"/80")}, bold: true, font: "Arial", size: 18 }})] }})] }}),
-        new TableCell({{ borders, shading: {{ fill: {js(row_fill)}, type: ShadingType.CLEAR }},
-          width: {{ size: 4960, type: WidthType.DXA }}, margins: {{ top:80, bottom:80, left:120, right:120 }},
-          children: [new Paragraph({{ children: [new TextRun({{ text: {js(p.get("verdict",""))}, font: "Arial", size: 18 }})] }})] }}),
-      ] }}),"""
-
-    # Dimension averages scorecard rows
-    dim_avg_row1 = ""
-    for dk, dl in zip(dim_keys, dim_labels):
-        s = dim_avg.get(dk, 0)
-        col = score_color_hex(s)
-        dim_avg_row1 += f"""
-        new TableCell({{ borders, shading: {{ fill: "{col}", type: ShadingType.CLEAR }},
-          width: {{ size: 1170, type: WidthType.DXA }}, margins: {{ top:80, bottom:80, left:60, right:60 }},
-          children: [
-            new Paragraph({{ alignment: AlignmentType.CENTER, children: [new TextRun({{ text: {js(dl)}, font: "Arial", size: 14, color: "FFFFFF", bold: true }})] }}),
-            new Paragraph({{ alignment: AlignmentType.CENTER, children: [new TextRun({{ text: {js(str(s)+"/10")}, font: "Arial", size: 24, bold: true, color: "FFFFFF" }})] }}),
-          ] }}),"""
-
-    logo_path_js = json.dumps(LOGO_PATH)
-
-    script = f"""
-const fs = require('fs');
+    # Static JS template — reads ALL content from the JSON file, zero f-string injection
+    js_script = r"""
+'use strict';
+const fs   = require('fs');
 const path = require('path');
-const {{
+const {
   Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell,
   ImageRun, Header, Footer, AlignmentType, HeadingLevel, BorderStyle,
-  WidthType, ShadingType, VerticalAlign, PageNumber, PageBreak,
-  LevelFormat, ExternalHyperlink
-}} = require('docx');
+  WidthType, ShadingType, VerticalAlign, PageNumber, PageBreak, LevelFormat
+} = require('docx');
 
-const logoData = fs.readFileSync({logo_path_js});
-const border = {{ style: BorderStyle.SINGLE, size: 1, color: "DDDDDD" }};
-const borders = {{ top: border, bottom: border, left: border, right: border }};
-const noBorder = {{ style: BorderStyle.NONE }};
-const noBorders = {{ top: noBorder, bottom: noBorder, left: noBorder, right: noBorder }};
+const DATA_FILE = process.argv[2];
+const OUT_FILE  = process.argv[3];
 
-const doc = new Document({{
-  numbering: {{
-    config: [
-      {{ reference: "bullets", levels: [{{ level: 0, format: LevelFormat.BULLET, text: "•",
+const d = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+
+const company   = d.company_name  || 'Client';
+const domain    = d.domain        || '';
+const avg       = d.average_score || 0;
+const dimAvg    = d.dimension_averages || {};
+const pages     = d.pages         || [];
+const themes    = d.cross_cutting_themes || [];
+const recs      = d.recommendations || [];
+const summary   = d.executive_summary || '';
+const monthYear = d.month_year    || '';
+const logoPath  = d.logo_path     || '';
+const dimKeys   = d.dim_keys;
+const dimLabels = d.dim_labels;
+const dimColors = d.dim_colors;
+
+const logoData = fs.existsSync(logoPath) ? fs.readFileSync(logoPath) : null;
+
+const THIN  = { style: BorderStyle.SINGLE, size: 1,  color: 'DDDDDD' };
+const NONE  = { style: BorderStyle.NONE };
+const RED_LINE = { style: BorderStyle.SINGLE, size: 4, color: 'D93B1A' };
+const borders   = { top: THIN, bottom: THIN, left: THIN, right: THIN };
+const noBorders = { top: NONE, bottom: NONE, left: NONE, right: NONE };
+
+function txt(text, opts) {
+  return new TextRun(Object.assign({ text: String(text), font: 'Arial', size: 20 }, opts || {}));
+}
+function para(children, opts) {
+  if (!Array.isArray(children)) children = [children];
+  return new Paragraph(Object.assign({ children }, opts || {}));
+}
+function cell(children, width, opts) {
+  if (!Array.isArray(children)) children = [children];
+  return new TableCell(Object.assign({
+    borders,
+    width: { size: width, type: WidthType.DXA },
+    margins: { top: 80, bottom: 80, left: 120, right: 120 },
+    children
+  }, opts || {}));
+}
+function hdrCell(label, width, bg) {
+  return cell(
+    [para([txt(label, { bold: true, color: 'FFFFFF', size: 18 })])],
+    width,
+    { shading: { fill: bg || 'D93B1A', type: ShadingType.CLEAR } }
+  );
+}
+function scoreCell(score, width) {
+  const col = score <= 2 ? 'C0392B' : score <= 5 ? 'E67E22' : '27AE60';
+  return cell(
+    [para([txt(score + '/10', { bold: true, color: 'FFFFFF', size: 22 })])],
+    width,
+    { shading: { fill: col, type: ShadingType.CLEAR } }
+  );
+}
+function textCell(text, width, opts) {
+  return cell([para([txt(text, { size: 18 })])], width, opts || {});
+}
+function colorCell(text, width, fill) {
+  return cell(
+    [para([txt(text, { bold: true, size: 18 })])],
+    width,
+    { shading: { fill: fill, type: ShadingType.CLEAR } }
+  );
+}
+
+// ── Header ──────────────────────────────────────────────────────────────────
+const headerChildren = [
+  new Table({
+    width: { size: 9906, type: WidthType.DXA },
+    columnWidths: [1200, 8706],
+    rows: [new TableRow({ children: [
+      new TableCell({ borders: noBorders, width: { size: 1200, type: WidthType.DXA },
+        children: logoData ? [para([new ImageRun({ data: logoData, transformation: { width: 50, height: 50 }, type: 'png' })])] : [para([txt('')])] }),
+      new TableCell({ borders: noBorders, width: { size: 8706, type: WidthType.DXA },
+        verticalAlign: VerticalAlign.CENTER,
+        children: [para([txt('AI VISIBILITY AUDIT \u00b7 ' + company.toUpperCase() + ' \u00b7 ' + monthYear.toUpperCase(), { size: 16, color: '6B6B6B' })], { alignment: AlignmentType.RIGHT })] }),
+    ]})]
+  }),
+  para([txt('')], { border: { bottom: RED_LINE } }),
+];
+
+// ── Footer ──────────────────────────────────────────────────────────────────
+const footerChildren = [
+  para([txt('')], { border: { top: RED_LINE } }),
+  para([
+    txt('SUMMITMEDIA.CO.UK', { size: 16, color: '6B6B6B' }),
+    txt('\t\tPREPARED BY SUMMIT \u00b7 AI VISIBILITY PRACTICE', { size: 16, color: '6B6B6B' }),
+    txt('\t\t', { size: 16 }),
+    new TextRun({ children: [new PageNumber()], font: 'Arial', size: 16, color: '6B6B6B' }),
+  ]),
+];
+
+// ── Scorecard table ──────────────────────────────────────────────────────────
+const scorecardRows = [
+  new TableRow({ tableHeader: true, children: [
+    hdrCell('PAGE', 3500), hdrCell('SCORE', 900), hdrCell('VERDICT', 4960)
+  ]})
+];
+pages.forEach(function(p, i) {
+  const fill = i % 2 === 0 ? 'F5F4F2' : 'FFFFFF';
+  const shade = { shading: { fill, type: ShadingType.CLEAR } };
+  scorecardRows.push(new TableRow({ children: [
+    cell([para([txt(p.title || ('Page '+(i+1)), { bold: true, size: 18 })])], 3500, shade),
+    cell([para([txt((p.score||0)+'/80', { bold: true, size: 18 })], { alignment: AlignmentType.CENTER })], 900, shade),
+    cell([para([txt(p.verdict || '', { size: 18 })])], 4960, shade),
+  ]}));
+});
+
+// ── Dimension averages row ───────────────────────────────────────────────────
+const dimAvgCells = dimKeys.map(function(dk, i) {
+  const s = dimAvg[dk] || 0;
+  const col = dimColors[dk] || '27AE60';
+  return cell([
+    para([txt(dimLabels[i], { size: 14, bold: true, color: 'FFFFFF' })], { alignment: AlignmentType.CENTER }),
+    para([txt(s+'/10', { size: 24, bold: true, color: 'FFFFFF' })], { alignment: AlignmentType.CENTER }),
+  ], 1170, { shading: { fill: col, type: ShadingType.CLEAR } });
+});
+
+// ── Per-page sections ────────────────────────────────────────────────────────
+const pageSections = [];
+pages.forEach(function(p, i) {
+  const dims = p.dimensions || {};
+  const dimRows = dimKeys.map(function(dk, di) {
+    const dim = dims[dk] || {};
+    const s   = dim.score || 0;
+    const col = (p.dim_colors || {})[dk] || '27AE60';
+    return new TableRow({ children: [
+      cell([para([txt(dimLabels[di], { bold: true, color: 'FFFFFF', size: 18 })])], 1200,
+        { shading: { fill: col, type: ShadingType.CLEAR } }),
+      cell([para([txt(s+'/10', { bold: true, size: 20 })], { alignment: AlignmentType.CENTER })], 600, {}),
+      cell([para([txt(dim.detail || '', { size: 18 })])], 7160, {}),
+    ]});
+  });
+
+  const sfParas = (p.specific_findings || []).map(function(sf) {
+    return para([txt(sf, { size: 20 })], { numbering: { reference: 'bullets', level: 0 } });
+  });
+  if (!sfParas.length) sfParas.push(para([txt('No specific findings recorded.', { size: 20 })]));
+
+  pageSections.push(
+    para([txt('PAGE '+(i+1)+': '+(p.title||'').toUpperCase(), { size: 28, bold: true, color: 'D93B1A' })],
+      { heading: HeadingLevel.HEADING_1 }),
+    para([txt('URL: ', { bold: true, size: 20 }), txt(p.url||'', { size: 20, color: 'D93B1A' })]),
+    para([txt('Total score: '+(p.score||0)+'/80', { bold: true, size: 20 })]),
+    para([txt(p.headline_finding || '', { size: 20, italics: true })], {
+      spacing: { before: 160 },
+      border: { left: { style: BorderStyle.SINGLE, size: 20, color: 'D93B1A' } },
+      indent: { left: 360 }
+    }),
+    para([txt('Dimension Breakdown', { size: 24, bold: true })], { heading: HeadingLevel.HEADING_2 }),
+    new Table({ width: { size: 8960, type: WidthType.DXA }, columnWidths: [1200, 600, 7160], rows: dimRows }),
+    para([txt('Specific Findings', { size: 24, bold: true })], { heading: HeadingLevel.HEADING_2 }),
+    ...sfParas,
+    para([new PageBreak()])
+  );
+});
+
+// ── Themes ───────────────────────────────────────────────────────────────────
+const themeParas = [];
+themes.forEach(function(t) {
+  themeParas.push(
+    para([txt(t.title||'', { size: 24, bold: true })], { heading: HeadingLevel.HEADING_2 }),
+    para([txt(t.detail||'', { size: 20 })], { spacing: { before: 80, after: 160 } })
+  );
+});
+if (!themeParas.length) themeParas.push(para([txt('No cross-cutting themes identified.', { size: 20 })]));
+
+// ── Recommendations table ────────────────────────────────────────────────────
+const recRows = [
+  new TableRow({ tableHeader: true, children: [
+    hdrCell('PRI.', 600), hdrCell('ACTION', 4200), hdrCell('IMPACT', 1800),
+    hdrCell('EFFORT', 1500), hdrCell('OWNER', 1260)
+  ]})
+];
+recs.forEach(function(r, i) {
+  const fill = i % 2 === 0 ? 'F5F4F2' : 'FFFFFF';
+  const shade = { shading: { fill, type: ShadingType.CLEAR } };
+  recRows.push(new TableRow({ children: [
+    cell([para([txt(r.priority||'', { bold: true, size: 18, color: 'D93B1A' })])], 600, shade),
+    cell([para([txt(r.action||'', { size: 18 })])], 4200, shade),
+    cell([para([txt(r.impact||'', { size: 18 })])], 1800, shade),
+    cell([para([txt(r.effort||'', { size: 18 })])], 1500, shade),
+    cell([para([txt(r.owner||'', { size: 18 })])], 1260, shade),
+  ]}));
+});
+
+// ── Document ─────────────────────────────────────────────────────────────────
+const doc = new Document({
+  numbering: {
+    config: [{
+      reference: 'bullets',
+      levels: [{ level: 0, format: LevelFormat.BULLET, text: '\u2022',
         alignment: AlignmentType.LEFT,
-        style: {{ paragraph: {{ indent: {{ left: 720, hanging: 360 }} }} }} }}] }},
-    ]
-  }},
-  styles: {{
-    default: {{ document: {{ run: {{ font: "Arial", size: 20 }} }} }},
+        style: { paragraph: { indent: { left: 720, hanging: 360 } } } }]
+    }]
+  },
+  styles: {
+    default: { document: { run: { font: 'Arial', size: 20 } } },
     paragraphStyles: [
-      {{ id: "Heading1", name: "Heading 1", basedOn: "Normal", next: "Normal", quickFormat: true,
-        run: {{ size: 32, bold: true, font: "Arial", color: "1A1A1A" }},
-        paragraph: {{ spacing: {{ before: 320, after: 160 }}, outlineLevel: 0 }} }},
-      {{ id: "Heading2", name: "Heading 2", basedOn: "Normal", next: "Normal", quickFormat: true,
-        run: {{ size: 24, bold: true, font: "Arial", color: "1A1A1A" }},
-        paragraph: {{ spacing: {{ before: 240, after: 120 }}, outlineLevel: 1 }} }},
+      { id: 'Heading1', name: 'Heading 1', basedOn: 'Normal', next: 'Normal', quickFormat: true,
+        run: { size: 32, bold: true, font: 'Arial', color: '1A1A1A' },
+        paragraph: { spacing: { before: 320, after: 160 }, outlineLevel: 0 } },
+      { id: 'Heading2', name: 'Heading 2', basedOn: 'Normal', next: 'Normal', quickFormat: true,
+        run: { size: 24, bold: true, font: 'Arial', color: '1A1A1A' },
+        paragraph: { spacing: { before: 240, after: 120 }, outlineLevel: 1 } },
     ]
-  }},
-  sections: [{{
-    properties: {{
-      page: {{
-        size: {{ width: 11906, height: 16838 }},
-        margin: {{ top: 1000, right: 1000, bottom: 1000, left: 1000 }}
-      }}
-    }},
-    headers: {{
-      default: new Header({{
-        children: [
-          new Table({{
-            width: {{ size: 9906, type: WidthType.DXA }},
-            columnWidths: [1200, 8706],
-            rows: [
-              new TableRow({{ children: [
-                new TableCell({{ borders: noBorders, width: {{ size: 1200, type: WidthType.DXA }},
-                  children: [new Paragraph({{ children: [
-                    new ImageRun({{ data: logoData, transformation: {{ width: 50, height: 50 }}, type: "png" }})
-                  ] }})] }}),
-                new TableCell({{ borders: noBorders, width: {{ size: 8706, type: WidthType.DXA }},
-                  verticalAlign: VerticalAlign.CENTER,
-                  children: [new Paragraph({{ alignment: AlignmentType.RIGHT, children: [
-                    new TextRun({{ text: "AI VISIBILITY AUDIT · {company.upper()} · {month_year.upper()}", font: "Arial", size: 16, color: "6B6B6B" }})
-                  ] }})] }}),
-              ] }})
-            ]
-          }}),
-          new Paragraph({{ border: {{ bottom: {{ style: BorderStyle.SINGLE, size: 4, color: "D93B1A" }} }}, children: [] }}),
-        ]
-      }})
-    }},
-    footers: {{
-      default: new Footer({{
-        children: [
-          new Paragraph({{ border: {{ top: {{ style: BorderStyle.SINGLE, size: 4, color: "D93B1A" }} }},
-            children: [] }}),
-          new Paragraph({{ children: [
-            new TextRun({{ text: "SUMMITMEDIA.CO.UK", font: "Arial", size: 16, color: "6B6B6B" }}),
-            new TextRun({{ text: "\\t\\tPREPARED BY SUMMIT · AI VISIBILITY PRACTICE", font: "Arial", size: 16, color: "6B6B6B" }}),
-            new TextRun({{ text: "\\t\\t", font: "Arial", size: 16 }}),
-            new TextRun({{ children: [new PageNumber()], font: "Arial", size: 16, color: "6B6B6B" }}),
-          ] }}),
-        ]
-      }})
-    }},
+  },
+  sections: [{
+    properties: {
+      page: {
+        size: { width: 11906, height: 16838 },
+        margin: { top: 1000, right: 1000, bottom: 1000, left: 1000 }
+      }
+    },
+    headers: { default: new Header({ children: headerChildren }) },
+    footers: { default: new Footer({ children: footerChildren }) },
     children: [
-      // ── Cover ──
-      new Paragraph({{ spacing: {{ before: 400 }}, children: [
-        new TextRun({{ text: "AI VISIBILITY AUDIT", font: "Arial", size: 56, bold: true, color: "1A1A1A" }})
-      ] }}),
-      new Paragraph({{ children: [
-        new TextRun({{ text: {js(company)}, font: "Arial", size: 40, bold: true, color: "D93B1A" }})
-      ] }}),
-      new Paragraph({{ spacing: {{ after: 320 }}, children: [
-        new TextRun({{ text: "Technical readiness for the AI search era", font: "Arial", size: 24, italics: true, color: "6B6B6B" }})
-      ] }}),
-      new Table({{
-        width: {{ size: 4000, type: WidthType.DXA }},
+      // Cover
+      para([txt('AI VISIBILITY AUDIT', { size: 56, bold: true })], { spacing: { before: 400 } }),
+      para([txt(company, { size: 40, bold: true, color: 'D93B1A' })]),
+      para([txt('Technical readiness for the AI search era', { size: 24, italics: true, color: '6B6B6B' })],
+        { spacing: { after: 320 } }),
+      new Table({
+        width: { size: 4000, type: WidthType.DXA },
         columnWidths: [1800, 2200],
         rows: [
-          new TableRow({{ children: [
-            new TableCell({{ borders: noBorders, width: {{ size: 1800, type: WidthType.DXA }},
-              shading: {{ fill: "F5F4F2", type: ShadingType.CLEAR }},
-              margins: {{ top:80, bottom:80, left:120, right:120 }},
-              children: [new Paragraph({{ children: [new TextRun({{ text: "Domain", bold: true, font: "Arial", size: 18 }})] }})] }}),
-            new TableCell({{ borders: noBorders, width: {{ size: 2200, type: WidthType.DXA }},
-              shading: {{ fill: "F5F4F2", type: ShadingType.CLEAR }},
-              margins: {{ top:80, bottom:80, left:120, right:120 }},
-              children: [new Paragraph({{ children: [new TextRun({{ text: {js(domain)}, font: "Arial", size: 18, color: "D93B1A" }})] }})] }}),
-          ] }}),
-          new TableRow({{ children: [
-            new TableCell({{ borders: noBorders, width: {{ size: 1800, type: WidthType.DXA }},
-              shading: {{ fill: "F5F4F2", type: ShadingType.CLEAR }},
-              margins: {{ top:80, bottom:80, left:120, right:120 }},
-              children: [new Paragraph({{ children: [new TextRun({{ text: "Audit date", bold: true, font: "Arial", size: 18 }})] }})] }}),
-            new TableCell({{ borders: noBorders, width: {{ size: 2200, type: WidthType.DXA }},
-              shading: {{ fill: "F5F4F2", type: ShadingType.CLEAR }},
-              margins: {{ top:80, bottom:80, left:120, right:120 }},
-              children: [new Paragraph({{ children: [new TextRun({{ text: {js(month_year)}, font: "Arial", size: 18 }})] }})] }}),
-          ] }}),
-          new TableRow({{ children: [
-            new TableCell({{ borders: noBorders, width: {{ size: 1800, type: WidthType.DXA }},
-              shading: {{ fill: "F5F4F2", type: ShadingType.CLEAR }},
-              margins: {{ top:80, bottom:80, left:120, right:120 }},
-              children: [new Paragraph({{ children: [new TextRun({{ text: "Prepared by", bold: true, font: "Arial", size: 18 }})] }})] }}),
-            new TableCell({{ borders: noBorders, width: {{ size: 2200, type: WidthType.DXA }},
-              shading: {{ fill: "F5F4F2", type: ShadingType.CLEAR }},
-              margins: {{ top:80, bottom:80, left:120, right:120 }},
-              children: [new Paragraph({{ children: [new TextRun({{ text: "Summit Media · AI Visibility Practice", font: "Arial", size: 18 }})] }})] }}),
-          ] }}),
+          new TableRow({ children: [
+            cell([para([txt('Domain', { bold: true, size: 18 })])], 1800,
+              { borders: noBorders, shading: { fill: 'F5F4F2', type: ShadingType.CLEAR } }),
+            cell([para([txt(domain, { size: 18, color: 'D93B1A' })])], 2200,
+              { borders: noBorders, shading: { fill: 'F5F4F2', type: ShadingType.CLEAR } }),
+          ]}),
+          new TableRow({ children: [
+            cell([para([txt('Audit date', { bold: true, size: 18 })])], 1800,
+              { borders: noBorders, shading: { fill: 'F5F4F2', type: ShadingType.CLEAR } }),
+            cell([para([txt(monthYear, { size: 18 })])], 2200,
+              { borders: noBorders, shading: { fill: 'F5F4F2', type: ShadingType.CLEAR } }),
+          ]}),
+          new TableRow({ children: [
+            cell([para([txt('Prepared by', { bold: true, size: 18 })])], 1800,
+              { borders: noBorders, shading: { fill: 'F5F4F2', type: ShadingType.CLEAR } }),
+            cell([para([txt('Summit Media \u00b7 AI Visibility Practice', { size: 18 })])], 2200,
+              { borders: noBorders, shading: { fill: 'F5F4F2', type: ShadingType.CLEAR } }),
+          ]}),
         ]
-      }}),
-      new Paragraph({{ spacing: {{ before: 160 }}, children: [
-        new TextRun({{ text: "Confidential. Prepared for the " + {js(company)} + " digital team.", font: "Arial", size: 18, italics: true, color: "6B6B6B" }})
-      ] }}),
-      new Paragraph({{ children: [new PageBreak()] }}),
+      }),
+      para([txt('Confidential. Prepared for the ' + company + ' digital team.', { size: 18, italics: true, color: '6B6B6B' })],
+        { spacing: { before: 160 } }),
+      para([new PageBreak()]),
 
-      // ── Executive Summary ──
-      new Paragraph({{ heading: HeadingLevel.HEADING_1,
-        children: [new TextRun({{ text: "EXECUTIVE SUMMARY", font: "Arial", size: 28, bold: true }})] }}),
-      new Paragraph({{ spacing: {{ before: 80, after: 160 }},
-        children: [new TextRun({{ text: {js(summary)}, font: "Arial", size: 20 }})] }}),
+      // Executive Summary
+      para([txt('EXECUTIVE SUMMARY', { size: 28, bold: true })], { heading: HeadingLevel.HEADING_1 }),
+      para([txt(summary, { size: 20 })], { spacing: { before: 80, after: 160 } }),
 
-      // ── Headline scorecard ──
-      new Paragraph({{ heading: HeadingLevel.HEADING_2,
-        children: [new TextRun({{ text: "Headline Scorecard", font: "Arial", size: 24, bold: true }})] }}),
-      new Table({{
-        width: {{ size: 9360, type: WidthType.DXA }},
-        columnWidths: [3500, 900, 4960],
-        rows: [{scorecard_rows_js}
-        ]
-      }}),
+      // Scorecard
+      para([txt('Headline Scorecard', { size: 24, bold: true })], { heading: HeadingLevel.HEADING_2 }),
+      new Table({ width: { size: 9360, type: WidthType.DXA }, columnWidths: [3500, 900, 4960], rows: scorecardRows }),
 
-      // ── Dimension averages ──
-      new Paragraph({{ heading: HeadingLevel.HEADING_2, spacing: {{ before: 320 }},
-        children: [new TextRun({{ text: "Dimension Averages", font: "Arial", size: 24, bold: true }})] }}),
-      new Table({{
-        width: {{ size: 9360, type: WidthType.DXA }},
+      // Dimension averages
+      para([txt('Dimension Averages', { size: 24, bold: true })], { heading: HeadingLevel.HEADING_2, spacing: { before: 320 } }),
+      new Table({
+        width: { size: 9360, type: WidthType.DXA },
         columnWidths: [1170, 1170, 1170, 1170, 1170, 1170, 1170, 1170],
-        rows: [
-          new TableRow({{ children: [{dim_avg_row1}
-          ] }}),
-        ]
-      }}),
-      new Paragraph({{ children: [new PageBreak()] }}),
+        rows: [new TableRow({ children: dimAvgCells })]
+      }),
+      para([new PageBreak()]),
 
-      // ── Methodology ──
-      new Paragraph({{ heading: HeadingLevel.HEADING_1,
-        children: [new TextRun({{ text: "METHODOLOGY", font: "Arial", size: 28, bold: true }})] }}),
-      new Paragraph({{ children: [new TextRun({{ text: "This audit treats {js(domain)[1:-1]}'s site the way ChatGPT, Perplexity, Gemini and Claude actually consume it. AI crawlers fetch a URL, parse the static HTML returned on first request, look for structured data, and decide whether the page is citable for a user's query. They do not execute a full JavaScript render in most cases.", font: "Arial", size: 20 }})] }}),
-      new Paragraph({{ heading: HeadingLevel.HEADING_2,
-        children: [new TextRun({{ text: "The Eight Dimensions", font: "Arial", size: 24, bold: true }})] }}),
-      new Paragraph({{ numbering: {{ reference: "bullets", level: 0 }}, children: [new TextRun({{ text: "ARIA implementation. Semantic landmarks, role attributes, descriptive aria-label values.", font: "Arial", size: 20 }})] }}),
-      new Paragraph({{ numbering: {{ reference: "bullets", level: 0 }}, children: [new TextRun({{ text: "Structured data / schema markup. Schema.org JSON-LD — the single highest-leverage signal for AI citation.", font: "Arial", size: 20 }})] }}),
-      new Paragraph({{ numbering: {{ reference: "bullets", level: 0 }}, children: [new TextRun({{ text: "Heading structure. A clean H1–H6 outline that gives crawlers a topical map of the page.", font: "Arial", size: 20 }})] }}),
-      new Paragraph({{ numbering: {{ reference: "bullets", level: 0 }}, children: [new TextRun({{ text: "Meta and SEO signals. Title, description, canonical, Open Graph, Twitter Card, robots, language.", font: "Arial", size: 20 }})] }}),
-      new Paragraph({{ numbering: {{ reference: "bullets", level: 0 }}, children: [new TextRun({{ text: "Link quality. Internal consistency, descriptive anchor text, protocol uniformity, link density.", font: "Arial", size: 20 }})] }}),
-      new Paragraph({{ numbering: {{ reference: "bullets", level: 0 }}, children: [new TextRun({{ text: "Image alt text. Descriptive alt attributes — the cheapest accessibility-and-AI dual win available.", font: "Arial", size: 20 }})] }}),
-      new Paragraph({{ numbering: {{ reference: "bullets", level: 0 }}, children: [new TextRun({{ text: "Crawlability and JS dependency. Whether content is present in static HTML or requires JS execution.", font: "Arial", size: 20 }})] }}),
-      new Paragraph({{ numbering: {{ reference: "bullets", level: 0 }}, children: [new TextRun({{ text: "LLM content signals. First-hand expertise, named authors, dates, citations, accreditations.", font: "Arial", size: 20 }})] }}),
-      new Paragraph({{ heading: HeadingLevel.HEADING_2,
-        children: [new TextRun({{ text: "Scoring Bands", font: "Arial", size: 24, bold: true }})] }}),
-      new Paragraph({{ numbering: {{ reference: "bullets", level: 0 }}, children: [new TextRun({{ text: "Red (1–2): Critical. Actively blocking AI visibility. Fix first.", font: "Arial", size: 20 }})] }}),
-      new Paragraph({{ numbering: {{ reference: "bullets", level: 0 }}, children: [new TextRun({{ text: "Amber (3–5): Capping. Under-performing relative to what's possible. High value to fix.", font: "Arial", size: 20 }})] }}),
-      new Paragraph({{ numbering: {{ reference: "bullets", level: 0 }}, children: [new TextRun({{ text: "Green (6+): Working. Meets the bar AI crawlers expect.", font: "Arial", size: 20 }})] }}),
-      new Paragraph({{ children: [new PageBreak()] }}),
+      // Methodology
+      para([txt('METHODOLOGY', { size: 28, bold: true })], { heading: HeadingLevel.HEADING_1 }),
+      para([txt('This audit treats ' + domain + '\'s site the way ChatGPT, Perplexity, Gemini and Claude actually consume it. AI crawlers fetch a URL, parse the static HTML on first request, look for structured data, and decide whether the page is citable. They do not execute a full JavaScript render in most cases.', { size: 20 })]),
+      para([txt('The Eight Dimensions', { size: 24, bold: true })], { heading: HeadingLevel.HEADING_2 }),
+      ...['ARIA implementation. Semantic landmarks, role attributes, descriptive aria-label values.',
+          'Structured data / schema markup. Schema.org JSON-LD — the single highest-leverage signal for AI citation.',
+          'Heading structure. A clean H1\u2013H6 outline that gives crawlers a topical map of the page.',
+          'Meta and SEO signals. Title, description, canonical, Open Graph, Twitter Card, robots, language.',
+          'Link quality. Internal consistency, descriptive anchor text, protocol uniformity, link density.',
+          'Image alt text. Descriptive alt attributes \u2014 the cheapest accessibility-and-AI dual win available.',
+          'Crawlability and JS dependency. Whether content is present in static HTML or requires JS execution.',
+          'LLM content signals. First-hand expertise, named authors, dates, citations, accreditations.',
+      ].map(function(t) { return para([txt(t, { size: 20 })], { numbering: { reference: 'bullets', level: 0 } }); }),
+      para([txt('Scoring Bands', { size: 24, bold: true })], { heading: HeadingLevel.HEADING_2 }),
+      para([txt('Red (1\u20132): Critical. Actively blocking AI visibility. Fix first.', { size: 20 })], { numbering: { reference: 'bullets', level: 0 } }),
+      para([txt('Amber (3\u20135): Capping. Under-performing relative to what\u2019s possible. High value to fix.', { size: 20 })], { numbering: { reference: 'bullets', level: 0 } }),
+      para([txt('Green (6+): Working. Meets the bar AI crawlers expect.', { size: 20 })], { numbering: { reference: 'bullets', level: 0 } }),
+      para([new PageBreak()]),
 
-      // ── Per-page sections ──
-      {page_sections_js}
+      // Per-page sections
+      ...pageSections,
 
-      // ── Cross-cutting themes ──
-      new Paragraph({{ heading: HeadingLevel.HEADING_1,
-        children: [new TextRun({{ text: "CROSS-CUTTING THEMES", font: "Arial", size: 28, bold: true }})] }}),
-      {themes_js if themes_js else "new Paragraph({ children: [new TextRun({ text: 'No cross-cutting themes identified.', font: 'Arial', size: 20 })] }),"}
-      new Paragraph({{ children: [new PageBreak()] }}),
+      // Cross-cutting themes
+      para([txt('CROSS-CUTTING THEMES', { size: 28, bold: true })], { heading: HeadingLevel.HEADING_1 }),
+      ...themeParas,
+      para([new PageBreak()]),
 
-      // ── Recommendations ──
-      new Paragraph({{ heading: HeadingLevel.HEADING_1,
-        children: [new TextRun({{ text: "PRIORITY RECOMMENDATIONS", font: "Arial", size: 28, bold: true }})] }}),
-      new Paragraph({{ spacing: {{ after: 160 }}, children: [new TextRun({{ text: "Ranked by AI-citation impact relative to implementation cost. P1 = ship in the next sprint. P2 = ship this quarter. P3 = ship when convenient.", font: "Arial", size: 20, italics: true }})] }}),
-      new Table({{
-        width: {{ size: 9360, type: WidthType.DXA }},
-        columnWidths: [600, 4200, 1800, 1500, 1260],
-        rows: [{rec_rows_js}
-        ]
-      }}),
+      // Recommendations
+      para([txt('PRIORITY RECOMMENDATIONS', { size: 28, bold: true })], { heading: HeadingLevel.HEADING_1 }),
+      para([txt('Ranked by AI-citation impact relative to implementation cost. P1 = ship in the next sprint. P2 = ship this quarter. P3 = ship when convenient.', { size: 20, italics: true })],
+        { spacing: { after: 160 } }),
+      new Table({ width: { size: 9360, type: WidthType.DXA }, columnWidths: [600, 4200, 1800, 1500, 1260], rows: recRows }),
     ]
-  }}]
-}});
+  }]
+});
 
-Packer.toBuffer(doc).then(buf => {{
-  fs.writeFileSync('/tmp/audit_output.docx', buf);
+Packer.toBuffer(doc).then(function(buf) {
+  fs.writeFileSync(OUT_FILE, buf);
   console.log('OK');
-}}).catch(e => {{ console.error(e); process.exit(1); }});
+}).catch(function(e) { console.error(e); process.exit(1); });
 """
 
-    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
-        f.write(script)
-        script_path = f.name
+    script_file = tempfile.NamedTemporaryFile("w", suffix=".js", delete=False)
+    script_file.write(js_script)
+    script_file.close()
 
+    out_path = "/tmp/audit_output.docx"
     result = subprocess.run(
-        ["node", script_path],
-        capture_output=True, text=True, timeout=60
+        ["node", script_file.name, data_file.name, out_path],
+        capture_output=True, text=True, timeout=90
     )
-    os.unlink(script_path)
+    os.unlink(script_file.name)
+    os.unlink(data_file.name)
 
     if result.returncode != 0:
-        raise RuntimeError(f"docx generation failed:\n{result.stderr}")
+        raise RuntimeError(f"docx generation failed:\n{result.stderr[-2000:]}")
 
-    with open("/tmp/audit_output.docx", "rb") as f:
+    with open(out_path, "rb") as f:
         return f.read()
+
+
 
 
 # ─── Build One-Pager PDF ──────────────────────────────────────────────────────
@@ -674,8 +636,9 @@ def build_onepager(data: dict, month_year: str) -> bytes:
     W = A4[0] - 30*mm
 
     def sty(name="Normal", **kw):
-        return ParagraphStyle(name, fontName="Helvetica", fontSize=9,
-                              leading=12, textColor=SUMMIT_DARK_RL, **kw)
+        defaults = dict(fontName="Helvetica", fontSize=9, leading=12, textColor=SUMMIT_DARK_RL)
+        defaults.update(kw)
+        return ParagraphStyle(name, **defaults)
 
     story = []
 
