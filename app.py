@@ -140,6 +140,35 @@ def extract_page_signals(url: str, html: str) -> str:
         img_sample.append(f"alt={repr(alt)} src={src}")
     out.append(f"IMAGES (total: {len(imgs)}):\n" + "\n".join(img_sample))
 
+    # ── Inline JS data stores (Next.js, Nuxt, etc.) ─────────────────
+    # Even JS-heavy sites embed page data in __NEXT_DATA__ or similar
+    next_data = soup.find("script", id="__NEXT_DATA__")
+    if next_data and next_data.string:
+        try:
+            import json as _json
+            nd = _json.loads(next_data.string)
+            # Extract text-like values up to 600 chars
+            def _extract_strings(obj, depth=0):
+                if depth > 4: return []
+                if isinstance(obj, str) and len(obj) > 20:
+                    return [obj[:120]]
+                if isinstance(obj, dict):
+                    vals = []
+                    for v in obj.values():
+                        vals.extend(_extract_strings(v, depth+1))
+                    return vals[:10]
+                if isinstance(obj, list):
+                    vals = []
+                    for v in obj[:5]:
+                        vals.extend(_extract_strings(v, depth+1))
+                    return vals[:10]
+                return []
+            strings = _extract_strings(nd)
+            if strings:
+                out.append("NEXT_DATA_CONTENT:\n" + "\n".join(strings[:15]))
+        except Exception:
+            pass
+
     # ── Body content sample (for LLM signal) ─────────────────────────
     body = soup.find("body")
     if body:
@@ -156,19 +185,63 @@ def fetch_pages(domain: str, extra_urls: list[str]) -> dict[str, str]:
         base = "https://" + base
 
     urls = [base] + [u.strip() for u in extra_urls if u.strip()][:3]
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (compatible; GPTBot/1.0)"  # mimic AI crawler UA
-        )
+
+    # Use a realistic browser UA — many enterprise sites (Cloudflare, Akamai,
+    # Salesforce Commerce Cloud etc.) block known bot UAs like GPTBot outright.
+    # We want to see what an AI crawler actually sees, which means getting the
+    # real page first, not a bot-challenge page.
+    BROWSER_UA = (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+    BROWSER_HEADERS = {
+        "User-Agent":      BROWSER_UA,
+        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-GB,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Cache-Control":   "no-cache",
     }
+
+    session = requests.Session()
+    session.headers.update(BROWSER_HEADERS)
+
     pages = {}
     for url in urls:
         try:
-            r = requests.get(url, headers=headers, timeout=15)
-            signals = extract_page_signals(url, r.text)
+            r = session.get(url, timeout=15, allow_redirects=True)
+            html = r.text
+
+            # Detect JS-only shell: if body text is tiny but there are many
+            # <script> tags, flag it clearly for Gemini rather than sending
+            # an empty signal set that looks like a real page with nothing on it.
+            from bs4 import BeautifulSoup as _BS
+            _soup = _BS(html, "html.parser")
+            for t in _soup(["script","style","noscript","svg"]): t.decompose()
+            body_text = _soup.get_text(" ", strip=True)
+            script_count = html.lower().count("<script")
+
+            if len(body_text) < 200 and script_count > 3:
+                # JS-rendered site — still extract what we can from the shell
+                # (meta, JSON-LD in __NEXT_DATA__, canonical, hreflang etc.)
+                signals = extract_page_signals(url, r.text)
+                note = (
+                    "\n\nFETCH_NOTE: This page appears to be client-side rendered "
+                    f"(body text: {len(body_text)} chars, script tags: {script_count}). "
+                    "Meta tags and any inline JSON-LD above were extracted from the "
+                    "static shell. Score CRAWL dimension low (1-3) and note that "
+                    "AI crawlers cannot reliably index this content without JS execution. "
+                    "Other dimensions should be scored based on what IS present in the shell."
+                )
+                signals += note
+            else:
+                signals = extract_page_signals(url, r.text)
+
             pages[url] = signals
+
         except Exception as e:
             pages[url] = f"[ERROR fetching {url}: {e}]"
+
     return pages
 
 # ─── Gemini audit ─────────────────────────────────────────────────────────────
