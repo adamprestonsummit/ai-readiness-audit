@@ -49,8 +49,108 @@ def get_gemini_client():
     return genai.GenerativeModel("gemini-2.5-flash")
 
 # ─── Fetch URL HTML ───────────────────────────────────────────────────────────
+def extract_page_signals(url: str, html: str) -> str:
+    """
+    Compress a raw HTML page into a compact signal summary for Gemini.
+    Instead of sending thousands of tokens of raw HTML, we extract exactly
+    what an AI auditor needs: meta, schema, headings, links, alt text, ARIA.
+    This keeps each page under ~2000 tokens while preserving all audit signals.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "noscript", "svg", "path"]):
+        tag.decompose()
+
+    out = [f"URL: {url}"]
+
+    # ── Meta & Open Graph ──────────────────────────────────────────────
+    meta_items = []
+    title = soup.find("title")
+    if title: meta_items.append(f"title: {title.get_text().strip()[:120]}")
+    for m in soup.find_all("meta"):
+        name = m.get("name","") or m.get("property","")
+        val  = m.get("content","")
+        if name and val and name.lower() in [
+            "description","robots","author","article:author",
+            "article:published_time","article:modified_time",
+            "og:title","og:type","og:description","og:url","og:image",
+            "og:locale","og:site_name","twitter:card","twitter:title",
+            "twitter:description","viewport"
+        ]:
+            meta_items.append(f"{name}: {val[:120]}")
+    link_tags = []
+    for l in soup.find_all("link", rel=True):
+        rel = " ".join(l.get("rel",[]))
+        if rel in ["canonical","alternate"]:
+            link_tags.append(f"<link rel={rel} href={l.get('href','')[:80]}>")
+    out.append("META:\n" + "\n".join(meta_items[:20] + link_tags[:5]))
+
+    # ── Schema / JSON-LD ──────────────────────────────────────────────
+    schemas = []
+    for s in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        txt = s.string or s.get_text()
+        if txt and txt.strip():
+            schemas.append(txt.strip()[:500])
+    # Fallback: regex search raw HTML in case BeautifulSoup missed it
+    if not schemas:
+        import re as _re
+        raw_schemas = _re.findall(
+            r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+            html, _re.DOTALL | _re.IGNORECASE
+        )
+        schemas = [s.strip()[:500] for s in raw_schemas if s.strip()]
+    out.append("SCHEMA_JSON_LD: " + ("; ".join(schemas) if schemas else "NONE FOUND"))
+
+    # ── Heading structure ─────────────────────────────────────────────
+    headings = []
+    for tag in soup.find_all(["h1","h2","h3","h4"]):
+        txt = tag.get_text(" ", strip=True)[:80]
+        if txt:
+            headings.append(f"<{tag.name}>{txt}</{tag.name}>")
+        if len(headings) >= 20: break
+    out.append("HEADINGS:\n" + ("\n".join(headings) if headings else "NONE FOUND"))
+
+    # ── ARIA usage ────────────────────────────────────────────────────
+    aria_items = []
+    for tag in soup.find_all(True):
+        role  = tag.get("role","")
+        label = tag.get("aria-label","") or tag.get("aria-labelledby","")
+        curr  = tag.get("aria-current","")
+        if role:   aria_items.append(f"role={role}")
+        if label:  aria_items.append(f"aria-label={label[:60]}")
+        if curr:   aria_items.append(f"aria-current={curr}")
+        if len(aria_items) >= 15: break
+    out.append("ARIA: " + ("; ".join(aria_items) if aria_items else "NONE FOUND"))
+
+    # ── Navigation / links sample ─────────────────────────────────────
+    nav = soup.find("nav")
+    all_links = soup.find_all("a", href=True)
+    link_sample = []
+    for a in all_links[:40]:
+        href = a.get("href","")
+        txt  = a.get_text(" ",strip=True)[:50]
+        link_sample.append(f"{txt} -> {href[:80]}")
+    out.append(f"LINKS (total found: {len(all_links)}):\n" + "\n".join(link_sample[:25]))
+
+    # ── Images / alt text ─────────────────────────────────────────────
+    imgs = soup.find_all("img")
+    img_sample = []
+    for img in imgs[:20]:
+        alt = img.get("alt", "MISSING")
+        src = img.get("src","")[:60]
+        img_sample.append(f"alt={repr(alt)} src={src}")
+    out.append(f"IMAGES (total: {len(imgs)}):\n" + "\n".join(img_sample))
+
+    # ── Body content sample (for LLM signal) ─────────────────────────
+    body = soup.find("body")
+    if body:
+        text = " ".join(body.get_text(" ", strip=True).split())[:1500]
+        out.append(f"BODY_TEXT_SAMPLE:\n{text}")
+
+    return "\n\n".join(out)
+
+
 def fetch_pages(domain: str, extra_urls: list[str]) -> dict[str, str]:
-    """Fetch up to 4 pages: homepage + extras."""
+    """Fetch up to 4 pages and extract compact audit signals from each."""
     base = domain.rstrip("/")
     if not base.startswith("http"):
         base = "https://" + base
@@ -58,19 +158,15 @@ def fetch_pages(domain: str, extra_urls: list[str]) -> dict[str, str]:
     urls = [base] + [u.strip() for u in extra_urls if u.strip()][:3]
     headers = {
         "User-Agent": (
-            "Mozilla/5.0 (compatible; SummitAIAudit/1.0; "
-            "+https://summit.co.uk)"
+            "Mozilla/5.0 (compatible; GPTBot/1.0)"  # mimic AI crawler UA
         )
     }
     pages = {}
     for url in urls:
         try:
             r = requests.get(url, headers=headers, timeout=15)
-            soup = BeautifulSoup(r.text, "html.parser")
-            # strip script/style noise
-            for tag in soup(["script", "style", "noscript"]):
-                tag.decompose()
-            pages[url] = soup.prettify()[:40000]   # cap tokens
+            signals = extract_page_signals(url, r.text)
+            pages[url] = signals
         except Exception as e:
             pages[url] = f"[ERROR fetching {url}: {e}]"
     return pages
@@ -201,13 +297,17 @@ def repair_and_parse(raw: str) -> dict:
 
 
 def run_audit(model, pages: dict) -> dict:
+    # pages values are already compact signal summaries from extract_page_signals
     pages_text = ""
-    for url, html in pages.items():
-        pages_text += f"\n\n=== URL: {url} ===\n{html[:8000]}"
+    for url, signals in pages.items():
+        pages_text += f"\n\n{'='*60}\n{signals}\n"
 
     response = model.generate_content(
         AUDIT_PROMPT + "\n\nPages to audit:\n" + pages_text,
-        generation_config={"temperature": 0.1, "max_output_tokens": 8192},
+        generation_config={
+            "temperature": 0.1,
+            "max_output_tokens": 65536,   # 2.5-flash supports up to 65k output tokens
+        },
     )
     raw = clean_json_string(response.text)
 
@@ -1130,7 +1230,11 @@ if "audit" in st.session_state:
             s = dim_avg.get(dk, 0)
             badges += f'<span class="dim-badge" style="background:{score_color(s)}">{dl}: {s}/10</span>'
         st.markdown(f'<div style="padding:1rem">{badges}</div>', unsafe_allow_html=True)
-        st.markdown(f"**Executive summary:** {audit.get('executive_summary','')[:400]}…")
+        summary_full = audit.get('executive_summary','')
+        st.markdown(f"**Executive summary:** {summary_full[:300]}{'…' if len(summary_full)>300 else ''}")
+        if len(summary_full) > 300:
+            with st.expander("Read full summary"):
+                st.markdown(summary_full)
 
     # Page tabs
     pages_data = audit.get("pages", [])
