@@ -46,7 +46,7 @@ def get_gemini_client():
         st.error("GEMINI_API_KEY not found. Add it to Streamlit secrets.")
         st.stop()
     genai.configure(api_key=api_key)
-    return genai.GenerativeModel("gemini-2.5-flash-preview-04-17")
+    return genai.GenerativeModel("gemini-2.5-flash-preview-05-20")
 
 # ─── Fetch URL HTML ───────────────────────────────────────────────────────────
 def fetch_pages(domain: str, extra_urls: list[str]) -> dict[str, str]:
