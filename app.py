@@ -178,69 +178,146 @@ def extract_page_signals(url: str, html: str) -> str:
     return "\n\n".join(out)
 
 
-def fetch_pages(domain: str, extra_urls: list[str]) -> dict[str, str]:
-    """Fetch up to 4 pages and extract compact audit signals from each."""
+def _is_blocked(status: int, html: str) -> bool:
+    """Return True if the response looks like a bot-block or CF challenge."""
+    if status in (403, 429, 503):
+        return True
+    markers = ["just a moment", "_cf_chl_", "cf-browser-verification",
+               "enable javascript", "checking your browser", "host not in allowlist",
+               "access denied", "403 forbidden"]
+    snippet = html[:3000].lower()
+    return any(m in snippet for m in markers)
+
+
+def _is_js_shell(html: str) -> bool:
+    """Return True if page has almost no body text but many script tags."""
+    soup = BeautifulSoup(html, "html.parser")
+    for t in soup(["script","style","noscript","svg"]): t.decompose()
+    body_text = soup.get_text(" ", strip=True)
+    script_count = html.lower().count("<script")
+    return len(body_text) < 300 and script_count > 3
+
+
+def _fetch_direct(url: str, session: requests.Session) -> tuple:
+    """Returns (html, status, source_label)."""
+    r = session.get(url, timeout=15, allow_redirects=True)
+    return r.text, r.status_code, "direct"
+
+
+def _fetch_wayback(url: str, session: requests.Session) -> tuple:
+    """
+    Fetch via Wayback Machine (web.archive.org).
+    Wayback crawls with Googlebot, so it bypasses most bot-protection
+    and returns what search/AI crawlers actually saw.
+    Returns (html, status, source_label) or raises on failure.
+    """
+    # Step 1: find the latest snapshot URL
+    avail_api = f"https://archive.org/wayback/available?url={url}"
+    meta = session.get(avail_api, timeout=10).json()
+    snapshots = meta.get("archived_snapshots", {})
+    closest   = snapshots.get("closest", {})
+    snap_url  = closest.get("url", "")
+    if not snap_url:
+        raise ValueError("No Wayback snapshot found")
+    # Convert to raw snapshot (remove Wayback toolbar injection)
+    # id_ suffix returns the original page without Wayback toolbar
+    snap_url = snap_url.replace("/web/", "/web/") 
+    raw_url  = snap_url.replace("http://web.archive.org/web/",
+                                 "https://web.archive.org/web/")
+    # Insert 'id_' flag to get clean original HTML
+    parts = raw_url.split("/web/", 1)
+    if len(parts) == 2:
+        ts_and_url = parts[1].split("/", 1)
+        if len(ts_and_url) == 2:
+            raw_url = f"https://web.archive.org/web/{ts_and_url[0]}id_/{ts_and_url[1]}"
+    r = session.get(raw_url, timeout=20, allow_redirects=True)
+    return r.text, r.status_code, f"Wayback Machine ({closest.get('timestamp','')})"
+
+
+def fetch_single_page(url: str, session: requests.Session) -> tuple:
+    """
+    Multi-strategy fetcher. Returns (signals_text, fetch_note).
+    Strategy: direct → Wayback fallback.
+    """
+    fetch_note = ""
+    html = ""
+
+    # ── Strategy 1: direct fetch ──────────────────────────────────
+    try:
+        html, status, label = _fetch_direct(url, session)
+        if _is_blocked(status, html):
+            raise ValueError(f"Blocked (status {status})")
+    except Exception as e:
+        # ── Strategy 2: Wayback Machine ───────────────────────────
+        try:
+            html, status, label = _fetch_wayback(url, session)
+            fetch_note = (
+                f"SOURCE_NOTE: Direct fetch was blocked ({e}). "
+                f"Content retrieved from {label} — reflects how AI crawlers "
+                "that use cached/crawled versions see this page."
+            )
+        except Exception as e2:
+            return (
+                f"URL: {url}\n\n[FETCH_FAILED: Could not retrieve page directly ({e}) "
+                f"or from Wayback Machine ({e2}). "
+                "The site may be heavily protected. Try pasting the page HTML manually.]",
+                ""
+            )
+
+    # ── Detect JS shell ───────────────────────────────────────────
+    is_shell = _is_js_shell(html)
+    signals  = extract_page_signals(url, html)
+
+    if is_shell:
+        soup = BeautifulSoup(html, "html.parser")
+        for t in soup(["script","style","noscript","svg"]): t.decompose()
+        body_len = len(soup.get_text(" ", strip=True))
+        sc       = html.lower().count("<script")
+        fetch_note += (
+            f"\nJS_SHELL_NOTE: Page appears client-side rendered "
+            f"(body text {body_len} chars, {sc} script tags). "
+            "Score CRAWL 1-3. Other dimensions scored from shell content above."
+        )
+
+    if fetch_note:
+        signals += "\n\n" + fetch_note
+
+    return signals, label
+
+
+def fetch_pages(domain: str, extra_urls: list[str],
+                pasted_html: dict | None = None) -> dict[str, str]:
+    """
+    Fetch up to 4 pages. pasted_html is an optional {url: html} dict
+    for manually pasted content (bypasses fetch entirely for that URL).
+    """
     base = domain.rstrip("/")
     if not base.startswith("http"):
         base = "https://" + base
 
     urls = [base] + [u.strip() for u in extra_urls if u.strip()][:3]
 
-    # Use a realistic browser UA — many enterprise sites (Cloudflare, Akamai,
-    # Salesforce Commerce Cloud etc.) block known bot UAs like GPTBot outright.
-    # We want to see what an AI crawler actually sees, which means getting the
-    # real page first, not a bot-challenge page.
-    BROWSER_UA = (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
-    BROWSER_HEADERS = {
-        "User-Agent":      BROWSER_UA,
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
         "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-GB,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
         "Cache-Control":   "no-cache",
-    }
-
-    session = requests.Session()
-    session.headers.update(BROWSER_HEADERS)
+    })
 
     pages = {}
     for url in urls:
-        try:
-            r = session.get(url, timeout=15, allow_redirects=True)
-            html = r.text
-
-            # Detect JS-only shell: if body text is tiny but there are many
-            # <script> tags, flag it clearly for Gemini rather than sending
-            # an empty signal set that looks like a real page with nothing on it.
-            from bs4 import BeautifulSoup as _BS
-            _soup = _BS(html, "html.parser")
-            for t in _soup(["script","style","noscript","svg"]): t.decompose()
-            body_text = _soup.get_text(" ", strip=True)
-            script_count = html.lower().count("<script")
-
-            if len(body_text) < 200 and script_count > 3:
-                # JS-rendered site — still extract what we can from the shell
-                # (meta, JSON-LD in __NEXT_DATA__, canonical, hreflang etc.)
-                signals = extract_page_signals(url, r.text)
-                note = (
-                    "\n\nFETCH_NOTE: This page appears to be client-side rendered "
-                    f"(body text: {len(body_text)} chars, script tags: {script_count}). "
-                    "Meta tags and any inline JSON-LD above were extracted from the "
-                    "static shell. Score CRAWL dimension low (1-3) and note that "
-                    "AI crawlers cannot reliably index this content without JS execution. "
-                    "Other dimensions should be scored based on what IS present in the shell."
-                )
-                signals += note
-            else:
-                signals = extract_page_signals(url, r.text)
-
+        if pasted_html and url in pasted_html:
+            # Use manually pasted HTML — no fetch needed
+            signals = extract_page_signals(url, pasted_html[url])
+            signals += "\n\nSOURCE_NOTE: HTML was manually provided."
             pages[url] = signals
-
-        except Exception as e:
-            pages[url] = f"[ERROR fetching {url}: {e}]"
+        else:
+            signals, _label = fetch_single_page(url, session)
+            pages[url] = signals
 
     return pages
 
@@ -1229,6 +1306,15 @@ st.markdown("**Additional pages to audit** (up to 3 internal URLs, one per line)
 extra_raw = st.text_area("", placeholder="https://healix.com/about\nhttps://healix.com/services", height=80)
 extra_urls = [u for u in extra_raw.strip().splitlines() if u.strip()]
 
+with st.expander("⚠️ Site blocked by bot protection? Paste HTML manually"):
+    st.markdown(
+        "Some sites (Cloudflare, Akamai etc.) block automated fetches. "
+        "If the audit shows no content, open the page in Chrome, press `Ctrl+U` "
+        "to view source, copy all, and paste below."
+    )
+    paste_url = st.text_input("URL this HTML belongs to", placeholder="https://cvp.com/")
+    paste_html_raw = st.text_area("Paste page HTML here", height=150, placeholder="<!DOCTYPE html>...")
+
 run = st.button("🚀 Run Audit", use_container_width=True)
 
 # ── Run audit and store everything in session_state ────────────────────────
@@ -1239,10 +1325,34 @@ if run:
 
     model = get_gemini_client()
 
-    with st.spinner("Fetching pages…"):
-        pages = fetch_pages(domain, extra_urls)
+    # Build pasted HTML dict if user provided any
+    pasted_html = {}
+    if paste_url.strip() and paste_html_raw.strip():
+        pasted_html[paste_url.strip()] = paste_html_raw
 
-    st.success(f"Fetched {len(pages)} page(s). Running Gemini audit…")
+    fetch_status = st.empty()
+    fetch_status.info("Fetching pages…")
+
+    pages = fetch_pages(domain, extra_urls, pasted_html or None)
+
+    # Show what actually happened per URL
+    fetch_log = []
+    for url, signals in pages.items():
+        if "FETCH_FAILED" in signals:
+            fetch_log.append(f"❌ **{url}** — fetch failed (see details in audit)")
+        elif "Wayback Machine" in signals:
+            fetch_log.append(f"🗄️ **{url}** — retrieved via Wayback Machine cache")
+        elif "manually provided" in signals:
+            fetch_log.append(f"📋 **{url}** — using pasted HTML")
+        elif "JS_SHELL" in signals:
+            fetch_log.append(f"⚠️ **{url}** — JS-rendered site (shell only)")
+        else:
+            fetch_log.append(f"✅ **{url}** — fetched successfully")
+
+    fetch_status.success(
+        f"Fetched {len(pages)} page(s). Running Gemini audit…\n\n" +
+        "\n".join(fetch_log)
+    )
 
     with st.spinner("Analysing with Gemini — this takes 20–40 seconds…"):
         try:
