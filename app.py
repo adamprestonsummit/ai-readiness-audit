@@ -335,12 +335,20 @@ Score EACH page 1-10 across these 8 dimensions:
 7. CRAWL – server-rendered static HTML vs JS dependency
 8. LLM – first-hand expertise, named entities, dates, citations, authority signals
 
-CRITICAL RULES:
+CRITICAL RULES FOR JSON:
 - Return ONLY raw JSON. No markdown, no ```json fences, no preamble, no explanation.
 - All string values must use double quotes. Never use single quotes inside JSON strings.
 - Escape any double quotes inside string values with a backslash.
 - Do not include trailing commas after the last item in any array or object.
 - Every string value must be on a single line with no literal newlines inside strings.
+
+CRITICAL RULES FOR CONTENT:
+- Write in British English throughout (use "optimise" not "optimize", "colour" not "color", "programme" not "program" etc.).
+- Never use long dashes (em dashes or en dashes used as sentence breaks). Use a comma, colon, or rewrite the sentence instead.
+- Never use the phrase "AI Visibility Practice".
+- The executive_summary field MUST be structured with these exact pipe-delimited sections:
+  OVERVIEW: 2-3 sentences on overall AI readiness. | STRENGTHS: up to 3 short bullet points of what is working (use * prefix). | GAPS: up to 3 short bullet points of the critical gaps (use * prefix). | VERDICT: 1 sentence on the single most impactful next step.
+  Example: "OVERVIEW: Healix.com is built on strong technical foundations. AI crawlers receive full server-rendered HTML on first request. | STRENGTHS: * Comprehensive Open Graph and meta tags on every page. * Server-rendered HTML with no JS dependency. * Verifiable first-hand expertise with named clinicians and clients. | GAPS: * Zero schema.org structured data across all audited pages. * Tab and disclosure widgets are invisible to AI parsers. * og:type defaults to website on product pages. | VERDICT: Shipping Organisation, Service and BreadcrumbList schema sitewide is the single biggest unlock available."
 
 Return ONLY valid JSON in exactly this structure:
 {
@@ -398,6 +406,12 @@ Return ONLY valid JSON in exactly this structure:
     {"point": "string", "detail": "string"}
   ]
 }
+
+IMPORTANT SCORING RULES:
+- Each page "score" is the SUM of its 8 dimension scores (each 1-10), so the maximum is 80.
+- "average_score" is the average of all page scores (i.e. average of those sums), so it is also out of 80. Do NOT return the average of dimension averages — that would give a number out of 10, which is wrong.
+- Example: if one page scores aria:6, schema:2, headings:7, meta:8, links:6, alt_text:4, crawl:8, llm:7 — its score is 48/80, not 6/10.
+- "dimension_averages" are the averages of each dimension across all pages, each still out of 10.
 
 IMPORTANT: The "recommendations" array MUST contain 8-12 items ranked by impact. Every audit has recommendations.
 Use priority P1 for highest impact quick wins, P2 for this quarter, P3 for backlog.
@@ -532,6 +546,24 @@ def run_audit(model, pages: dict) -> dict:
              "detail": f"Scoring {avg_scores.get(dk,0)}/10 — a priority improvement area."}
             for dk in worst
         ]
+
+    # ── Always recalculate scores from dimension data (don't trust Gemini's maths) ──
+    dim_keys = ["aria", "schema", "headings", "meta", "links", "alt_text", "crawl", "llm"]
+    for page in result.get("pages", []):
+        dims = page.get("dimensions", {})
+        dim_scores = [dims.get(dk, {}).get("score", 0) for dk in dim_keys]
+        if any(s > 0 for s in dim_scores):
+            page["score"] = sum(dim_scores)   # sum of 8 dims = score out of 80
+
+    # Recalculate dimension averages across all pages
+    pages = result.get("pages", [])
+    if pages:
+        for dk in dim_keys:
+            scores = [p.get("dimensions", {}).get(dk, {}).get("score", 0) for p in pages]
+            result.setdefault("dimension_averages", {})[dk] = round(sum(scores) / len(scores), 1)
+        # Recalculate average_score as average of page totals (out of 80)
+        page_totals = [p.get("score", 0) for p in pages]
+        result["average_score"] = round(sum(page_totals) / len(page_totals), 1)
 
     return result
 
@@ -669,10 +701,15 @@ function colorCell(text, width, fill) {
 }
 
 // ── Header ──────────────────────────────────────────────────────────────────
+const NO_TABLE_BORDER = {
+  top: NONE, bottom: NONE, left: NONE, right: NONE,
+  insideH: NONE, insideV: NONE,
+};
 const headerChildren = [
   new Table({
     width: { size: 9906, type: WidthType.DXA },
     columnWidths: [1200, 8706],
+    borders: NO_TABLE_BORDER,
     rows: [new TableRow({ children: [
       new TableCell({ borders: noBorders, width: { size: 1200, type: WidthType.DXA },
         children: logoData ? [para([new ImageRun({ data: logoData, transformation: { width: 50, height: 50 }, type: 'png' })])] : [para([txt('')])] }),
@@ -689,7 +726,7 @@ const footerChildren = [
   para([txt('')], { border: { top: RED_LINE } }),
   para([
     txt('SUMMITMEDIA.CO.UK', { size: 16, color: '6B6B6B' }),
-    txt('\t\tPREPARED BY SUMMIT \u00b7 AI VISIBILITY PRACTICE', { size: 16, color: '6B6B6B' }),
+    txt('\t\tSUMMITMEDIA.CO.UK', { size: 16, color: '6B6B6B' }),
     txt('\t\t', { size: 16 }),
     new TextRun({ children: [PageNumber.CURRENT], font: 'Arial', size: 16, color: '6B6B6B' }),
   ]),
@@ -789,6 +826,49 @@ recs.forEach(function(r, i) {
   ]}));
 });
 
+// ── Executive Summary renderer ───────────────────────────────────────────────
+function buildExecutiveSummary(raw) {
+  var paras = [];
+  // Parse pipe-delimited sections: OVERVIEW: ... | STRENGTHS: ... | GAPS: ... | VERDICT: ...
+  var sections = raw.split('|').map(function(s) { return s.trim(); });
+  sections.forEach(function(section) {
+    var colonIdx = section.indexOf(':');
+    if (colonIdx === -1) {
+      // No section label — just output as normal paragraph
+      if (section.trim()) {
+        paras.push(para([txt(section.trim(), { size: 20 })], { spacing: { before: 80, after: 100 } }));
+      }
+      return;
+    }
+    var label = section.substring(0, colonIdx).trim().toUpperCase();
+    var body  = section.substring(colonIdx + 1).trim();
+
+    // Section heading
+    paras.push(para([txt(label, { size: 20, bold: true, color: 'D93B1A' })],
+      { spacing: { before: 200, after: 60 } }));
+
+    // Split body into bullet lines (* prefix) and normal lines
+    var lines = body.split('*').map(function(l) { return l.trim(); }).filter(Boolean);
+    if (lines.length > 1) {
+      // Multiple items = bullet list
+      lines.forEach(function(line) {
+        paras.push(para([txt(line, { size: 20 })],
+          { numbering: { reference: 'bullets', level: 0 }, spacing: { after: 40 } }));
+      });
+    } else {
+      // Single block = normal paragraph
+      paras.push(para([txt(body, { size: 20 })],
+        { spacing: { before: 40, after: 100 } }));
+    }
+  });
+
+  // Fallback: if parsing produced nothing useful, just show raw text
+  if (paras.length === 0) {
+    paras.push(para([txt(raw, { size: 20 })], { spacing: { before: 80, after: 160 } }));
+  }
+  return paras;
+}
+
 // ── Document ─────────────────────────────────────────────────────────────────
 const doc = new Document({
   numbering: {
@@ -844,7 +924,7 @@ const doc = new Document({
           new TableRow({ children: [
             cell([para([txt('Prepared by', { bold: true, size: 18 })])], 1800,
               { borders: noBorders, shading: { fill: 'F5F4F2', type: ShadingType.CLEAR } }),
-            cell([para([txt('Summit Media \u00b7 AI Visibility Practice', { size: 18 })])], 2200,
+            cell([para([txt('Summit Media', { size: 18 })])], 2200,
               { borders: noBorders, shading: { fill: 'F5F4F2', type: ShadingType.CLEAR } }),
           ]}),
         ]
@@ -853,9 +933,9 @@ const doc = new Document({
         { spacing: { before: 160 } }),
       para([new PageBreak()]),
 
-      // Executive Summary
+      // Executive Summary — parse the structured pipe-delimited format
       para([txt('EXECUTIVE SUMMARY', { size: 28, bold: true })], { heading: HeadingLevel.HEADING_1 }),
-      para([txt(summary, { size: 20 })], { spacing: { before: 80, after: 160 } }),
+      ...buildExecutiveSummary(summary),
 
       // Scorecard
       para([txt('Headline Scorecard', { size: 24, bold: true })], { heading: HeadingLevel.HEADING_2 }),
@@ -1042,10 +1122,16 @@ def build_onepager(data: dict, month_year: str) -> bytes:
     ))
     story.append(Spacer(1, 3*mm))
 
-    # Intro: domain bold + first ~280 chars of summary
-    intro_text = safe(exec_summary)[:280].strip()
-    if len(exec_summary) > 280:
-        intro_text += "…"
+    # Intro: extract OVERVIEW section from structured summary, else first 280 chars
+    if 'OVERVIEW:' in exec_summary.upper():
+        # Pull just the OVERVIEW section (before first pipe)
+        overview_raw = exec_summary.split('|')[0]
+        colon_idx = overview_raw.find(':')
+        intro_text = safe(overview_raw[colon_idx+1:].strip()) if colon_idx != -1 else safe(overview_raw.strip())
+    else:
+        intro_text = safe(exec_summary)[:280].strip()
+        if len(exec_summary) > 280:
+            intro_text += "..."
     story.append(P(
         f'We audited <b>{safe(domain)}</b> the way ChatGPT, Perplexity, Gemini and Claude see it. '
         + intro_text,
@@ -1256,8 +1342,7 @@ def build_onepager(data: dict, month_year: str) -> bytes:
     # ════════════════════════════════════════════════════════════════
     story.append(P(
         '<font name="Helvetica" size="6.5" color="#6B6B6B">'
-        'SUMMITMEDIA.CO.UK &nbsp;&nbsp;&nbsp;&nbsp; '
-        'PREPARED BY SUMMIT &middot; AI VISIBILITY PRACTICE'
+        'SUMMITMEDIA.CO.UK'
         '</font>',
         alignment=TA_CENTER, leading=9,
     ))
@@ -1291,7 +1376,7 @@ st.markdown(f"""
 </style>
 <div class="summit-header">
   <h1>🔍 Summit · AI Visibility Audit Tool</h1>
-  <p>Audit any website the way ChatGPT, Perplexity, Gemini and Claude see it.</p>
+  <p>Audit any website the way ChatGPT, Perplexity, Gemini and Claude see it. Prepared by Summit.</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -1414,10 +1499,29 @@ if "audit" in st.session_state:
             badges += f'<span class="dim-badge" style="background:{score_color(s)}">{dl}: {s}/10</span>'
         st.markdown(f'<div style="padding:1rem">{badges}</div>', unsafe_allow_html=True)
         summary_full = audit.get('executive_summary','')
-        st.markdown(f"**Executive summary:** {summary_full[:300]}{'…' if len(summary_full)>300 else ''}")
-        if len(summary_full) > 300:
-            with st.expander("Read full summary"):
-                st.markdown(summary_full)
+        # Render the structured pipe-delimited format nicely in Streamlit
+        if '|' in summary_full:
+            sections = [s.strip() for s in summary_full.split('|') if s.strip()]
+            for sec in sections:
+                colon = sec.find(':')
+                if colon != -1:
+                    label = sec[:colon].strip()
+                    body  = sec[colon+1:].strip()
+                    # Bullet lines start with *
+                    if '*' in body:
+                        bullets = [b.strip() for b in body.split('*') if b.strip()]
+                        st.markdown(f"**{label}**")
+                        for b in bullets:
+                            st.markdown(f"- {b}")
+                    else:
+                        st.markdown(f"**{label}:** {body}")
+                else:
+                    st.markdown(sec)
+        else:
+            st.markdown(f"**Executive summary:** {summary_full[:300]}{'...' if len(summary_full)>300 else ''}")
+            if len(summary_full) > 300:
+                with st.expander("Read full summary"):
+                    st.markdown(summary_full)
 
     # Page tabs
     pages_data = audit.get("pages", [])
