@@ -592,6 +592,17 @@ def build_docx(data: dict, month_year: str) -> bytes:
 
     # Enrich data with derived fields the JS needs
     enriched = _json.loads(_json.dumps(data))   # deep copy via json
+
+    # Strip backticks and long dashes from all string values in the data
+    def _clean_strings(obj):
+        if isinstance(obj, str):
+            return obj.replace("`", "").replace("—", ",").replace("–", ",")
+        if isinstance(obj, dict):
+            return {k: _clean_strings(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_clean_strings(v) for v in obj]
+        return obj
+    enriched = _clean_strings(enriched)
     enriched["month_year"]   = month_year
     enriched["logo_path"]    = LOGO_PATH
     enriched["dim_keys"]     = dim_keys
@@ -1028,7 +1039,7 @@ def build_onepager(data: dict, month_year: str) -> bytes:
 
     company       = data.get("company_name", "Client")
     domain        = data.get("domain", "")
-    avg           = int(data.get("average_score", 0))
+    avg           = round(data.get("average_score", 0))
     dim_avg       = data.get("dimension_averages", {})
     exec_summary  = data.get("executive_summary", "")
     working       = data.get("whats_working", [])[:3]
@@ -1054,6 +1065,16 @@ def build_onepager(data: dict, month_year: str) -> bytes:
     def safe(text):
         """Escape XML special chars for ReportLab paragraphs."""
         return str(text).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+
+    def clean(text):
+        """Strip backticks and tidy punctuation for PDF display."""
+        import re as _re
+        t = str(text)
+        t = t.replace("`", "")           # remove all backticks
+        t = t.replace("—", ",")     # em dash -> comma
+        t = t.replace("–", ",")     # en dash -> comma
+        t = t.replace("  ", " ")        # double spaces
+        return safe(t.strip())
 
     buf = BytesIO()
 
@@ -1127,9 +1148,9 @@ def build_onepager(data: dict, month_year: str) -> bytes:
         # Pull just the OVERVIEW section (before first pipe)
         overview_raw = exec_summary.split('|')[0]
         colon_idx = overview_raw.find(':')
-        intro_text = safe(overview_raw[colon_idx+1:].strip()) if colon_idx != -1 else safe(overview_raw.strip())
+        intro_text = clean(overview_raw[colon_idx+1:].strip()) if colon_idx != -1 else clean(overview_raw.strip())
     else:
-        intro_text = safe(exec_summary)[:280].strip()
+        intro_text = clean(exec_summary)[:280].strip()
         if len(exec_summary) > 280:
             intro_text += "..."
     story.append(P(
@@ -1149,15 +1170,28 @@ def build_onepager(data: dict, month_year: str) -> bytes:
         f'<font name="Helvetica-Bold" size="48" color="#D93B1A">{avg}</font>'
         f'<font name="Helvetica" size="16" color="#6B6B6B">/80</font>'
     )
+    # Extract verdict line from structured summary for score box
+    verdict_text = ""
+    if "VERDICT:" in exec_summary.upper():
+        for part in exec_summary.split("|"):
+            if "VERDICT:" in part.upper():
+                ci = part.find(":")
+                verdict_text = clean(part[ci+1:].strip()) if ci != -1 else ""
+                break
+
     label_markup = (
         '<font name="Helvetica" size="7" color="#6B6B6B">AVERAGE PAGE SCORE</font><br/>'
         '<font name="Helvetica-Bold" size="13" color="#1A1A1A">A solid foundation.</font><br/>'
         '<font name="Helvetica-Bold" size="13" color="#D93B1A">A clear AI gap.</font>'
     )
+    if verdict_text:
+        label_markup += (
+            f'<br/><font name="Helvetica" size="7" color="#6B6B6B">{verdict_text[:160]}</font>'
+        )
 
     score_box = Table(
         [[P(score_markup, alignment=TA_CENTER, leading=52),
-          P(label_markup, leading=17)]],
+          P(label_markup, leading=15)]],
         colWidths=[SCORE_COL, TEXT_COL],
     )
     score_box.setStyle(TableStyle([
@@ -1217,8 +1251,8 @@ def build_onepager(data: dict, month_year: str) -> bytes:
         ])
         # Up to 3 bullet rows
         for it in items[:3]:
-            pt  = safe(it.get("point",""))
-            det = safe(it.get("detail",""))
+            pt  = clean(it.get("point",""))
+            det = clean(it.get("detail",""))
             rows.append([
                 P(
                     f'<font name="Helvetica-Bold" size="8" color="{icon_color_hex}">{icon} </font>'
@@ -1282,9 +1316,9 @@ def build_onepager(data: dict, month_year: str) -> bytes:
     THIRD = W / 3
     win_rows = []
     for w in wins:
-        num    = safe(w.get("number",""))
-        title  = safe(w.get("title",""))
-        detail = safe(w.get("detail",""))
+        num    = clean(w.get("number",""))
+        title  = clean(w.get("title",""))
+        detail = clean(w.get("detail",""))
         win_rows.append(
             P(
                 f'<font name="Helvetica-Bold" size="26" color="#D93B1A">{num}</font><br/>'
@@ -1475,7 +1509,7 @@ if "audit" in st.session_state:
     pdf_bytes  = st.session_state["pdf_bytes"]
 
     company  = audit.get("company_name", domain)
-    avg      = audit.get("average_score", 0)
+    avg      = round(audit.get("average_score", 0))
     dim_avg  = audit.get("dimension_averages", {})
     dim_keys   = ["aria","schema","headings","meta","links","alt_text","crawl","llm"]
     dim_labels = ["ARIA","SCHEMA","HEADINGS","META","LINKS","ALT TEXT","CRAWL","LLM"]
@@ -1493,7 +1527,9 @@ if "audit" in st.session_state:
         </div>""", unsafe_allow_html=True)
 
     with c2:
-        badges = ""
+        n_pages = len(audit.get("pages", []))
+        page_label = f"Average across {n_pages} page{'s' if n_pages != 1 else ''}"
+        badges = f'<div style="font-size:0.7rem;color:{SUMMIT_GREY};margin-bottom:4px">{page_label}</div>'
         for dk, dl in zip(dim_keys, dim_labels):
             s = dim_avg.get(dk, 0)
             badges += f'<span class="dim-badge" style="background:{score_color(s)}">{dl}: {s}/10</span>'
