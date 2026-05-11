@@ -1422,7 +1422,7 @@ with col2:
     month_year = st.text_input("Audit month / year", value=datetime.now().strftime("%B %Y"))
 
 st.markdown("**Additional pages to audit** (up to 3 internal URLs, one per line)")
-extra_raw = st.text_area("", placeholder="https://example.com/category\nhttps://example.com/product", height=80)
+extra_raw = st.text_area("", placeholder="https://example.com/category\nhttps://example.com/product\nhttps://example.com/blog", height=80)
 extra_urls = [u for u in extra_raw.strip().splitlines() if u.strip()]
 
 with st.expander("⚠️ Site blocked by bot protection? Paste HTML manually"):
