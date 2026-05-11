@@ -1417,12 +1417,12 @@ st.markdown(f"""
 # ─── Inputs ───────────────────────────────────────────────────────────────────
 col1, col2 = st.columns([2, 1])
 with col1:
-    domain = st.text_input("Domain to audit", placeholder="e.g. healix.com")
+    domain = st.text_input("Domain to audit", placeholder="e.g. example.com")
 with col2:
     month_year = st.text_input("Audit month / year", value=datetime.now().strftime("%B %Y"))
 
 st.markdown("**Additional pages to audit** (up to 3 internal URLs, one per line)")
-extra_raw = st.text_area("", placeholder="https://healix.com/about\nhttps://healix.com/services", height=80)
+extra_raw = st.text_area("", placeholder="https://example.com/category\nhttps://example.com/product", height=80)
 extra_urls = [u for u in extra_raw.strip().splitlines() if u.strip()]
 
 with st.expander("⚠️ Site blocked by bot protection? Paste HTML manually"):
@@ -1431,7 +1431,7 @@ with st.expander("⚠️ Site blocked by bot protection? Paste HTML manually"):
         "If the audit shows no content, open the page in Chrome, press `Ctrl+U` "
         "to view source, copy all, and paste below."
     )
-    paste_url = st.text_input("URL this HTML belongs to", placeholder="https://cvp.com/")
+    paste_url = st.text_input("URL this HTML belongs to", placeholder="https://www.example.com/")
     paste_html_raw = st.text_area("Paste page HTML here", height=150, placeholder="<!DOCTYPE html>...")
 
 run = st.button("🚀 Run Audit", use_container_width=True)
