@@ -289,13 +289,42 @@ def fetch_pages(domain: str, extra_urls: list[str],
                 pasted_html: dict | None = None) -> dict[str, str]:
     """
     Fetch up to 4 pages. pasted_html is an optional {url: html} dict
-    for manually pasted content (bypasses fetch entirely for that URL).
+    for manually pasted content (bypasses fetch entirely for those URLs).
+
+    URL priority order:
+    1. All pasted URLs (already have HTML, no fetch needed)
+    2. The base domain homepage
+    3. Any extra_urls typed in the text area
+    Up to 4 total, deduped, preserving order.
     """
     base = domain.rstrip("/")
     if not base.startswith("http"):
         base = "https://" + base
 
-    urls = [base] + [u.strip() for u in extra_urls if u.strip()][:3]
+    # Build the master URL list — pasted URLs come first so they're
+    # guaranteed a slot; then homepage; then any manually typed extras.
+    seen = {}
+    ordered_urls = []
+
+    def add_url(u):
+        u = u.strip().rstrip("/")
+        if u and u not in seen:
+            seen[u] = True
+            ordered_urls.append(u)
+
+    # 1. Pasted URLs (guaranteed to be processed)
+    for u in (pasted_html or {}).keys():
+        add_url(u)
+
+    # 2. Homepage
+    add_url(base)
+
+    # 3. Extra typed URLs
+    for u in extra_urls:
+        add_url(u)
+
+    # Cap at 4
+    urls = ordered_urls[:4]
 
     session = requests.Session()
     session.headers.update({
@@ -310,9 +339,17 @@ def fetch_pages(domain: str, extra_urls: list[str],
 
     pages = {}
     for url in urls:
-        if pasted_html and url in pasted_html:
-            # Use manually pasted HTML — no fetch needed
-            signals = extract_page_signals(url, pasted_html[url])
+        # Normalise for lookup (strip trailing slash)
+        lookup = url.rstrip("/")
+        pasted_match = None
+        if pasted_html:
+            for pu, ph in pasted_html.items():
+                if pu.rstrip("/") == lookup:
+                    pasted_match = ph
+                    break
+
+        if pasted_match:
+            signals = extract_page_signals(url, pasted_match)
             signals += "\n\nSOURCE_NOTE: HTML was manually provided."
             pages[url] = signals
         else:
@@ -1035,16 +1072,18 @@ Packer.toBuffer(doc).then(function(buf) {
 
 # ─── Build One-Pager PDF ──────────────────────────────────────────────────────
 def build_onepager(data: dict, month_year: str) -> bytes:
-    import re as _re
-
-    company       = data.get("company_name", "Client")
-    domain        = data.get("domain", "")
-    avg           = round(data.get("average_score", 0))
-    dim_avg       = data.get("dimension_averages", {})
-    exec_summary  = data.get("executive_summary", "")
-    working       = data.get("whats_working", [])[:3]
-    holding       = data.get("whats_holding_back", [])[:3]
-    wins          = data.get("three_quick_wins", [])[:3]
+    """
+    Guaranteed single-page A4 PDF.
+    All sections use fixed rowHeights so text is clipped, never expanding the page.
+    """
+    company      = data.get("company_name", "Client")
+    domain       = data.get("domain", "")
+    avg          = round(data.get("average_score", 0))
+    dim_avg      = data.get("dimension_averages", {})
+    exec_summary = data.get("executive_summary", "")
+    working      = data.get("whats_working", [])[:3]
+    holding      = data.get("whats_holding_back", [])[:3]
+    wins         = data.get("three_quick_wins", [])[:3]
 
     dim_keys   = ["aria","schema","headings","meta","links","alt_text","crawl","llm"]
     dim_labels = ["ARIA","SCHEMA","HEADINGS","META","LINKS","ALT TEXT","CRAWL","LLM"]
@@ -1054,7 +1093,6 @@ def build_onepager(data: dict, month_year: str) -> bytes:
     GREY  = colors.HexColor("#6B6B6B")
     LIGHT = colors.HexColor("#F5F4F2")
     GREEN = colors.HexColor("#27AE60")
-    AMBER = colors.HexColor("#E67E22")
     WHITE = colors.white
 
     def dim_color(s):
@@ -1062,28 +1100,21 @@ def build_onepager(data: dict, month_year: str) -> bytes:
         if s <= 5: return colors.HexColor("#E67E22")
         return colors.HexColor("#27AE60")
 
-    def safe(text):
-        """Escape XML special chars for ReportLab paragraphs."""
-        return str(text).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+    def safe(t):
+        return str(t).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
-    def clean(text):
-        """Strip backticks and tidy punctuation for PDF display."""
-        import re as _re
-        t = str(text)
-        t = t.replace("`", "")           # remove all backticks
-        t = t.replace("—", ",")     # em dash -> comma
-        t = t.replace("–", ",")     # en dash -> comma
-        t = t.replace("  ", " ")        # double spaces
+    def clean(t):
+        t = str(t).replace("`","").replace("\u2014",",").replace("\u2013",",").replace("  "," ")
         return safe(t.strip())
 
+    # ── Page geometry ────────────────────────────────────────────────
+    PAGE_W, PAGE_H = A4          # 595 x 842 pt
+    ML = MR = 13*mm
+    MT = MB = 10*mm
+    W  = PAGE_W - ML - MR        # usable width
+    H  = PAGE_H - MT - MB        # usable height ~822pt
+
     buf = BytesIO()
-
-    # Page: A4, tight margins to give maximum layout room
-    PAGE_W, PAGE_H = A4
-    ML = MR = 14*mm
-    MT = MB = 12*mm
-    W = PAGE_W - ML - MR   # usable width ~182mm
-
     doc = SimpleDocTemplate(
         buf, pagesize=A4,
         leftMargin=ML, rightMargin=MR,
@@ -1091,295 +1122,305 @@ def build_onepager(data: dict, month_year: str) -> bytes:
     )
 
     # ── Style factory ────────────────────────────────────────────────
-    _style_cache = {}
+    _sc = {}
     def S(name, **kw):
         key = name + str(sorted(kw.items()))
-        if key not in _style_cache:
-            base = dict(fontName="Helvetica", fontSize=8, leading=11,
+        if key not in _sc:
+            base = dict(fontName="Helvetica", fontSize=8, leading=10,
                         textColor=DARK, spaceAfter=0, spaceBefore=0)
             base.update(kw)
-            _style_cache[key] = ParagraphStyle(name + str(len(_style_cache)), **base)
-        return _style_cache[key]
+            _sc[key] = ParagraphStyle(name + str(len(_sc)), **base)
+        return _sc[key]
 
     def P(markup, **kw):
         return Paragraph(markup, S("p", **kw))
 
+    # ── Fixed height budget (pts) — must fit within H ────────────────
+    # A4 usable height ~822pt with 10mm margins.
+    # Every value here is the EXACT height allocated; text beyond is clipped.
+    ROW_HDR  = 33   # logo header row
+    ROW_HERO = 50   # headline + intro paragraph
+    ROW_SCOR = 40   # score box
+    ROW_DIMS = 26   # dimension badge strip
+    ROW_WH   = 26   # each what's working / holding content row (x3)
+    ROW_WHHD = 16   # header row of what's working table
+    ROW_WINS = 24   # wins label row (needle / quick wins heading)
+    ROW_WNUM = 76   # wins content row (number + title + detail)
+    ROW_CTA  = 34   # CTA bar
+    ROW_FOOT = 12   # footer
+
+    # Spacers between sections (pts, not mm)
+    SP1 = 4   # after header
+    SP2 = 3   # after hero
+    SP3 = 3   # after score
+    SP4 = 3   # after dims
+    SP5 = 3   # after WH section
+    SP6 = 3   # after wins
+
+    # No spare distribution — keep sizes fixed so page never overflows
+
+    # ═══════════════════════════════════════════════════════════════
+    # HELPER: Table cell that clips content to a fixed height
+    # ReportLab clips automatically when rowHeights is specified and
+    # splitByRow=0 is not set — we just need to specify the heights.
+    # ═══════════════════════════════════════════════════════════════
+
     story = []
 
-    # ════════════════════════════════════════════════════════════════
-    # 1. HEADER — logo left, tag right
-    # ════════════════════════════════════════════════════════════════
-    LOGO_W = LOGO_H = 32
-
-    logo_cell = RLImage(LOGO_PATH, width=LOGO_W, height=LOGO_H) if os.path.exists(LOGO_PATH) else P("")
-    tag_markup = (
-        f'<font name="Helvetica" size="6.5" color="#6B6B6B">'
-        f'AI VISIBILITY SNAPSHOT<br/>'
-        f'{safe(company).upper()} &middot; {safe(month_year).upper()}</font>'
+    # ═══════════════════════════════════════════════════════════════
+    # 1. HEADER
+    # ═══════════════════════════════════════════════════════════════
+    LOGO_SZ = 26
+    logo_cell = RLImage(LOGO_PATH, width=LOGO_SZ, height=LOGO_SZ) if os.path.exists(LOGO_PATH) else P("")
+    hdr_t = Table(
+        [[logo_cell,
+          P(f'<font name="Helvetica" size="6" color="#6B6B6B">AI VISIBILITY SNAPSHOT<br/>'
+            f'{safe(company).upper()} &middot; {safe(month_year).upper()}</font>',
+            alignment=TA_RIGHT, leading=8)]],
+        colWidths=[LOGO_SZ + 3*mm, W - LOGO_SZ - 3*mm],
+        rowHeights=[ROW_HDR - 4],
     )
-    hdr = Table(
-        [[logo_cell, P(tag_markup, alignment=TA_RIGHT, leading=9)]],
-        colWidths=[LOGO_W + 4*mm, W - LOGO_W - 4*mm],
-        rowHeights=[LOGO_H],
-    )
-    hdr.setStyle(TableStyle([
-        ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
-        ("LEFTPADDING",   (0,0), (-1,-1), 0),
-        ("RIGHTPADDING",  (0,0), (-1,-1), 0),
-        ("TOPPADDING",    (0,0), (-1,-1), 0),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 4),
-        ("LINEBELOW",     (0,0), (-1,-1), 1.5, RED),
+    hdr_t.setStyle(TableStyle([
+        ("VALIGN",        (0,0),(-1,-1),"MIDDLE"),
+        ("LEFTPADDING",   (0,0),(-1,-1),0),
+        ("RIGHTPADDING",  (0,0),(-1,-1),0),
+        ("TOPPADDING",    (0,0),(-1,-1),0),
+        ("BOTTOMPADDING", (0,0),(-1,-1),2),
+        ("LINEBELOW",     (0,0),(-1,-1),1.5,RED),
     ]))
-    story.append(hdr)
-    story.append(Spacer(1, 5*mm))
+    story.append(hdr_t)
+    story.append(Spacer(1, SP1))
 
-    # ════════════════════════════════════════════════════════════════
-    # 2. HERO HEADLINE + INTRO
-    # ════════════════════════════════════════════════════════════════
-    story.append(P(
-        '<font name="Helvetica-Bold" size="20">Is your site ready<br/>'
-        f'for the <font color="#D93B1A"><i>AI search era?</i></font></font>',
-        leading=26,
-    ))
-    story.append(Spacer(1, 3*mm))
-
-    # Intro: extract OVERVIEW section from structured summary, else first 280 chars
+    # ═══════════════════════════════════════════════════════════════
+    # 2. HERO HEADLINE + INTRO  (fixed height table so it cannot grow)
+    # ═══════════════════════════════════════════════════════════════
     if 'OVERVIEW:' in exec_summary.upper():
-        # Pull just the OVERVIEW section (before first pipe)
-        overview_raw = exec_summary.split('|')[0]
-        colon_idx = overview_raw.find(':')
-        intro_text = clean(overview_raw[colon_idx+1:].strip()) if colon_idx != -1 else clean(overview_raw.strip())
+        ov = exec_summary.split('|')[0]
+        ci = ov.find(':')
+        intro_raw = clean(ov[ci+1:].strip()) if ci != -1 else clean(ov)
     else:
-        intro_text = clean(exec_summary)[:280].strip()
-        if len(exec_summary) > 280:
-            intro_text += "..."
-    story.append(P(
-        f'We audited <b>{safe(domain)}</b> the way ChatGPT, Perplexity, Gemini and Claude see it. '
-        + intro_text,
-        fontSize=8, leading=11,
-    ))
-    story.append(Spacer(1, 4*mm))
+        intro_raw = clean(exec_summary)
+    # 165 chars fits ~2 lines at 7pt/9lead within ROW_HERO
+    intro_txt = intro_raw[:165] + ("..." if len(intro_raw) > 165 else "")
 
-    # ════════════════════════════════════════════════════════════════
-    # 3. SCORE BOX  (score left | label + tagline right)
-    # ════════════════════════════════════════════════════════════════
-    SCORE_COL = 38*mm
-    TEXT_COL  = W - SCORE_COL
-
-    score_markup = (
-        f'<font name="Helvetica-Bold" size="48" color="#D93B1A">{avg}</font>'
-        f'<font name="Helvetica" size="16" color="#6B6B6B">/80</font>'
+    hero_t = Table(
+        [[P('<font name="Helvetica-Bold" size="17">Is your site ready '
+            f'for the <font color="#D93B1A"><i>AI search era?</i></font></font>',
+            leading=20)],
+         [P(f'We audited <b>{safe(domain)}</b> the way ChatGPT, Perplexity, Gemini and Claude see it. '
+            + intro_txt, fontSize=7, leading=9)]],
+        colWidths=[W],
+        rowHeights=[22, ROW_HERO - 22],
     )
-    # Extract verdict line from structured summary for score box
+    hero_t.setStyle(TableStyle([
+        ("LEFTPADDING",   (0,0),(-1,-1),0),
+        ("RIGHTPADDING",  (0,0),(-1,-1),0),
+        ("TOPPADDING",    (0,0),(-1,-1),0),
+        ("BOTTOMPADDING", (0,0),(-1,-1),2),
+    ]))
+    story.append(hero_t)
+    story.append(Spacer(1, SP2))
+
+    # ═══════════════════════════════════════════════════════════════
+    # 3. SCORE BOX  — fixed height, verdict clipped to 1 line
+    # ═══════════════════════════════════════════════════════════════
     verdict_text = ""
     if "VERDICT:" in exec_summary.upper():
         for part in exec_summary.split("|"):
             if "VERDICT:" in part.upper():
                 ci = part.find(":")
-                verdict_text = clean(part[ci+1:].strip()) if ci != -1 else ""
+                verdict_text = clean(part[ci+1:].strip())[:140] if ci != -1 else ""
                 break
 
-    label_markup = (
-        '<font name="Helvetica" size="7" color="#6B6B6B">AVERAGE PAGE SCORE</font><br/>'
-        '<font name="Helvetica-Bold" size="13" color="#1A1A1A">A solid foundation.</font><br/>'
-        '<font name="Helvetica-Bold" size="13" color="#D93B1A">A clear AI gap.</font>'
+    label_html = (
+        '<font name="Helvetica" size="6.5" color="#6B6B6B">AVERAGE PAGE SCORE</font><br/>'
+        '<font name="Helvetica-Bold" size="12" color="#1A1A1A">A solid foundation. </font>'
+        '<font name="Helvetica-Bold" size="12" color="#D93B1A">A clear AI gap.</font>'
     )
     if verdict_text:
-        label_markup += (
-            f'<br/><font name="Helvetica" size="7" color="#6B6B6B">{verdict_text[:160]}</font>'
-        )
+        label_html += f'<br/><font name="Helvetica" size="6.5" color="#6B6B6B">{verdict_text}</font>'
 
-    score_box = Table(
-        [[P(score_markup, alignment=TA_CENTER, leading=52),
-          P(label_markup, leading=15)]],
-        colWidths=[SCORE_COL, TEXT_COL],
+    score_t = Table(
+        [[P(f'<font name="Helvetica-Bold" size="36" color="#D93B1A">{avg}</font>'
+            f'<font name="Helvetica" size="12" color="#6B6B6B">/80</font>',
+            alignment=TA_CENTER, leading=40),
+          P(label_html, leading=13)]],
+        colWidths=[34*mm, W - 34*mm],
+        rowHeights=[ROW_SCOR],
     )
-    score_box.setStyle(TableStyle([
-        ("BACKGROUND",    (0,0), (-1,-1), LIGHT),
-        ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
-        ("TOPPADDING",    (0,0), (-1,-1), 10),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 10),
-        ("LEFTPADDING",   (0,0), (0,0),   8),
-        ("LEFTPADDING",   (1,0), (1,0),   10),
-        ("RIGHTPADDING",  (0,0), (-1,-1), 8),
+    score_t.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0),(-1,-1),LIGHT),
+        ("VALIGN",        (0,0),(-1,-1),"MIDDLE"),
+        ("TOPPADDING",    (0,0),(-1,-1),4),
+        ("BOTTOMPADDING", (0,0),(-1,-1),4),
+        ("LEFTPADDING",   (0,0),(0,0),  6),
+        ("LEFTPADDING",   (1,0),(1,0),  8),
+        ("RIGHTPADDING",  (0,0),(-1,-1),6),
     ]))
-    story.append(score_box)
-    story.append(Spacer(1, 3*mm))
+    story.append(score_t)
+    story.append(Spacer(1, SP3))
 
-    # ════════════════════════════════════════════════════════════════
-    # 4. DIMENSION BADGES ROW
-    # ════════════════════════════════════════════════════════════════
-    cell_w = W / 8
+    # ═══════════════════════════════════════════════════════════════
+    # 4. DIMENSION BADGES  — fixed height
+    # ═══════════════════════════════════════════════════════════════
+    cw = W / 8
     dim_cells = []
     for dk, dl in zip(dim_keys, dim_labels):
         s = dim_avg.get(dk, 0)
         dim_cells.append(P(
-            f'<font name="Helvetica" size="5.5" color="#FFFFFF">{dl}<br/></font>'
-            f'<font name="Helvetica-Bold" size="13" color="#FFFFFF">{s}</font>'
-            f'<font name="Helvetica" size="7" color="#FFFFFF">/10</font>',
-            alignment=TA_CENTER, leading=10,
+            f'<font name="Helvetica" size="5" color="#FFFFFF">{dl}<br/></font>'
+            f'<font name="Helvetica-Bold" size="11" color="#FFFFFF">{s}</font>'
+            f'<font name="Helvetica" size="6" color="#FFFFFF">/10</font>',
+            alignment=TA_CENTER, leading=9,
         ))
-
-    dim_t = Table([dim_cells], colWidths=[cell_w]*8)
-    dim_styles = [
-        ("TOPPADDING",    (0,0), (-1,-1), 6),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 6),
-        ("LEFTPADDING",   (0,0), (-1,-1), 1),
-        ("RIGHTPADDING",  (0,0), (-1,-1), 1),
-    ]
+    dim_t = Table([dim_cells], colWidths=[cw]*8, rowHeights=[ROW_DIMS])
+    ds = [("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
+          ("LEFTPADDING",(0,0),(-1,-1),1),("RIGHTPADDING",(0,0),(-1,-1),1)]
     for i, dk in enumerate(dim_keys):
-        dim_styles.append(("BACKGROUND", (i,0), (i,0), dim_color(dim_avg.get(dk,0))))
-    dim_t.setStyle(TableStyle(dim_styles))
+        ds.append(("BACKGROUND",(i,0),(i,0),dim_color(dim_avg.get(dk,0))))
+    dim_t.setStyle(TableStyle(ds))
     story.append(dim_t)
-    story.append(Spacer(1, 5*mm))
+    story.append(Spacer(1, SP4))
 
-    # ════════════════════════════════════════════════════════════════
-    # 5. WHAT'S WORKING / HOLDING YOU BACK
-    #    Two independent tables placed side-by-side via a wrapper table
-    #    Key fix: build each side as a list of Paragraphs, NOT nested Tables
-    # ════════════════════════════════════════════════════════════════
-    GAP   = 5*mm
-    HALF  = (W - GAP) / 2
+    # ═══════════════════════════════════════════════════════════════
+    # 5. WHAT'S WORKING / HOLDING BACK
+    #    Fixed rowHeights on every row — content is clipped, never grows
+    # ═══════════════════════════════════════════════════════════════
+    GAP  = 4*mm
+    HALF = (W - GAP) / 2
+    # detail text char limit: ~100 chars fits 2 lines at 6.5pt within ROW_WH
+    DET_CAP = 85
 
     def build_side(items, hdr_text, hdr_color, icon, icon_color_hex):
-        """Returns a Table for one side (working or holding)."""
-        rows = []
-        # Header
-        rows.append([
-            P(f'<font name="Helvetica-Bold" size="8.5" color="#FFFFFF">{hdr_text}</font>',
-              leading=11),
-        ])
-        # Up to 3 bullet rows
-        for it in items[:3]:
-            pt  = clean(it.get("point",""))
-            det = clean(it.get("detail",""))
-            rows.append([
-                P(
-                    f'<font name="Helvetica-Bold" size="8" color="{icon_color_hex}">{icon} </font>'
-                    f'<font name="Helvetica-Bold" size="8">{pt}</font><br/>'
-                    f'<font name="Helvetica" size="7" color="#4A4A4A">{det}</font>',
-                    leading=11,
-                ),
-            ])
-        # Pad to 3 rows so both sides same height
-        while len(rows) < 4:
-            rows.append([P(" ", fontSize=7)])
+        row_heights = [ROW_WHHD]
+        rows = [[P(f'<font name="Helvetica-Bold" size="8" color="#FFFFFF">{hdr_text}</font>',
+                   leading=10)]]
+        for it in (items + [{}, {}, {}])[:3]:
+            pt  = clean(it.get("point","")) if it else ""
+            det = clean(it.get("detail",""))[:DET_CAP] if it else ""
+            content = (
+                f'<font name="Helvetica-Bold" size="7.5" color="{icon_color_hex}">{icon} </font>'
+                f'<font name="Helvetica-Bold" size="7.5">{pt}</font>'
+                + (f'<br/><font name="Helvetica" size="6.5" color="#4A4A4A">{det}</font>' if det else "")
+            ) if pt else " "
+            rows.append([P(content, leading=9)])
+            row_heights.append(ROW_WH)
 
-        t = Table(rows, colWidths=[HALF])
-        ts = [
-            # Header row bg
-            ("BACKGROUND",    (0,0), (-1,0),  hdr_color),
-            ("TOPPADDING",    (0,0), (-1,-1),  5),
-            ("BOTTOMPADDING", (0,0), (-1,-1),  5),
-            ("LEFTPADDING",   (0,0), (-1,-1),  7),
-            ("RIGHTPADDING",  (0,0), (-1,-1),  7),
-            ("VALIGN",        (0,0), (-1,-1),  "TOP"),
-            # Light bg on content rows
-            ("BACKGROUND",    (0,1), (-1,-1),  colors.HexColor("#F9F9F9")),
-            # Divider lines between content rows
-            ("LINEBELOW",     (0,1), (-1,-2),  0.4, colors.HexColor("#E0E0E0")),
-        ]
-        t.setStyle(TableStyle(ts))
+        t = Table(rows, colWidths=[HALF], rowHeights=row_heights)
+        t.setStyle(TableStyle([
+            ("BACKGROUND",    (0,0),(-1,0),  hdr_color),
+            ("BACKGROUND",    (0,1),(-1,-1), colors.HexColor("#F9F9F9")),
+            ("TOPPADDING",    (0,0),(-1,-1), 3),
+            ("BOTTOMPADDING", (0,0),(-1,-1), 3),
+            ("LEFTPADDING",   (0,0),(-1,-1), 6),
+            ("RIGHTPADDING",  (0,0),(-1,-1), 6),
+            ("VALIGN",        (0,0),(-1,-1), "TOP"),
+            ("LINEBELOW",     (0,1),(-1,-2), 0.4, colors.HexColor("#E0E0E0")),
+        ]))
         return t
 
-    working_t = build_side(working, "\u271a WHAT\u2019S WORKING",    GREEN, "\u271a", "#27AE60")
-    holding_t = build_side(holding, "! WHAT\u2019S HOLDING YOU BACK", RED,   "!",     "#D93B1A")
+    working_t = build_side(working, "\u271a WHAT\u2019S WORKING",     GREEN, "\u271a", "#27AE60")
+    holding_t = build_side(holding, "! WHAT\u2019S HOLDING YOU BACK", RED,   "!",      "#D93B1A")
 
-    sides = Table(
-        [[working_t, Spacer(GAP, 1), holding_t]],
-        colWidths=[HALF, GAP, HALF],
-    )
+    sides = Table([[working_t, Spacer(GAP,1), holding_t]],
+                  colWidths=[HALF, GAP, HALF])
     sides.setStyle(TableStyle([
-        ("VALIGN",       (0,0), (-1,-1), "TOP"),
-        ("LEFTPADDING",  (0,0), (-1,-1), 0),
-        ("RIGHTPADDING", (0,0), (-1,-1), 0),
-        ("TOPPADDING",   (0,0), (-1,-1), 0),
-        ("BOTTOMPADDING",(0,0), (-1,-1), 0),
+        ("VALIGN",        (0,0),(-1,-1),"TOP"),
+        ("LEFTPADDING",   (0,0),(-1,-1),0),
+        ("RIGHTPADDING",  (0,0),(-1,-1),0),
+        ("TOPPADDING",    (0,0),(-1,-1),0),
+        ("BOTTOMPADDING", (0,0),(-1,-1),0),
     ]))
     story.append(sides)
-    story.append(Spacer(1, 6*mm))
+    story.append(Spacer(1, SP5))
 
-    # ════════════════════════════════════════════════════════════════
-    # 6. THREE QUICK WINS
-    # ════════════════════════════════════════════════════════════════
-    story.append(HRFlowable(width=W, thickness=0.5, color=colors.HexColor("#DDDDDD"), spaceAfter=4))
-    story.append(P(
-        '<font name="Helvetica" size="6.5" color="#6B6B6B">THREE MOVES THAT MOVE THE NEEDLE</font>',
-        leading=9,
-    ))
-    story.append(P(
-        '<font name="Helvetica-Bold" size="13">Quick wins, big impact</font>',
-        leading=17,
-    ))
-    story.append(Spacer(1, 4*mm))
+    # ═══════════════════════════════════════════════════════════════
+    # 6. THREE QUICK WINS  — fixed height per win cell
+    # ═══════════════════════════════════════════════════════════════
+    story.append(HRFlowable(width=W, thickness=0.5, color=colors.HexColor("#DDDDDD"), spaceAfter=2))
+    # Section label + heading in one fixed-height row
+    label_t = Table(
+        [[P('<font name="Helvetica" size="5.5" color="#6B6B6B">THREE MOVES THAT MOVE THE NEEDLE</font><br/>'
+            '<font name="Helvetica-Bold" size="11">Quick wins, big impact</font>',
+            leading=11)]],
+        colWidths=[W], rowHeights=[ROW_WINS],
+    )
+    label_t.setStyle(TableStyle([
+        ("LEFTPADDING",   (0,0),(-1,-1),0),
+        ("RIGHTPADDING",  (0,0),(-1,-1),0),
+        ("TOPPADDING",    (0,0),(-1,-1),2),
+        ("BOTTOMPADDING", (0,0),(-1,-1),2),
+    ]))
+    story.append(label_t)
 
     THIRD = W / 3
-    win_rows = []
-    for w in wins:
-        num    = clean(w.get("number",""))
-        title  = clean(w.get("title",""))
-        detail = clean(w.get("detail",""))
-        win_rows.append(
-            P(
-                f'<font name="Helvetica-Bold" size="26" color="#D93B1A">{num}</font><br/>'
-                f'<font name="Helvetica-Bold" size="8.5">{title}</font><br/>'
-                f'<font name="Helvetica" size="7.5" color="#4A4A4A">{detail}</font>',
-                leading=13,
-            )
-        )
-    # Pad to 3
-    while len(win_rows) < 3:
-        win_rows.append(P(" "))
+    # detail cap: ~115 chars fits ~3 lines at 7pt/9lead within ROW_WNUM
+    WIN_DET_CAP = 100
+    win_cells = []
+    for w in (wins + [{},{},{}])[:3]:
+        num    = clean(w.get("number","")) if w else ""
+        title  = clean(w.get("title",""))  if w else ""
+        detail = clean(w.get("detail",""))[:WIN_DET_CAP] if w else ""
+        win_cells.append(P(
+            f'<font name="Helvetica-Bold" size="20" color="#D93B1A">{num}</font><br/>'
+            f'<font name="Helvetica-Bold" size="7.5">{title}</font><br/>'
+            f'<font name="Helvetica" size="7" color="#4A4A4A">{detail}</font>',
+            leading=10,
+        ) if num else P(" "))
 
-    wins_t = Table([win_rows], colWidths=[THIRD]*3)
+    wins_t = Table([win_cells], colWidths=[THIRD]*3, rowHeights=[ROW_WNUM])
     wins_t.setStyle(TableStyle([
-        ("VALIGN",        (0,0), (-1,-1), "TOP"),
-        ("TOPPADDING",    (0,0), (-1,-1), 0),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 0),
-        ("LEFTPADDING",   (0,0), (0,0),   0),
-        ("LEFTPADDING",   (1,0), (-1,-1), 8),
-        ("RIGHTPADDING",  (0,0), (-1,-1), 8),
-        ("LINEAFTER",     (0,0), (1,-1),  0.5, colors.HexColor("#DDDDDD")),
+        ("VALIGN",        (0,0),(-1,-1),"TOP"),
+        ("TOPPADDING",    (0,0),(-1,-1),2),
+        ("BOTTOMPADDING", (0,0),(-1,-1),0),
+        ("LEFTPADDING",   (0,0),(0,0),  0),
+        ("LEFTPADDING",   (1,0),(-1,-1),8),
+        ("RIGHTPADDING",  (0,0),(-1,-1),6),
+        ("LINEAFTER",     (0,0),(1,-1), 0.5, colors.HexColor("#DDDDDD")),
     ]))
     story.append(wins_t)
-    story.append(Spacer(1, 6*mm))
+    story.append(Spacer(1, SP6))
 
-    # ════════════════════════════════════════════════════════════════
-    # 7. CTA BAR
-    # ════════════════════════════════════════════════════════════════
-    cta_left = P(
-        '<font name="Helvetica-Bold" size="10">We\u2019ll walk your team through<br/>'
-        'every finding. <font color="#D93B1A"><i>No obligation.</i></font></font>',
-        leading=14,
+    # ═══════════════════════════════════════════════════════════════
+    # 7. CTA BAR  — fixed height
+    # ═══════════════════════════════════════════════════════════════
+    cta_t = Table(
+        [[P('<font name="Helvetica-Bold" size="9.5">We\u2019ll walk your team through<br/>'
+            'every finding. <font color="#D93B1A"><i>No obligation.</i></font></font>',
+            leading=13),
+          P('<font name="Helvetica" size="6" color="#6B6B6B">BOOK A SESSION<br/></font>'
+            '<font name="Helvetica-Bold" size="10">hello@summitmedia.com</font>',
+            alignment=TA_CENTER, leading=12)]],
+        colWidths=[W*0.52, W*0.48],
+        rowHeights=[ROW_CTA],
     )
-    cta_right = P(
-        '<font name="Helvetica" size="6.5" color="#6B6B6B">BOOK A SESSION<br/></font>'
-        '<font name="Helvetica-Bold" size="10.5">hello@summitmedia.com</font>',
-        alignment=TA_CENTER, leading=13,
-    )
-    cta_t = Table([[cta_left, cta_right]], colWidths=[W*0.52, W*0.48])
     cta_t.setStyle(TableStyle([
-        ("BACKGROUND",    (1,0), (1,0),  LIGHT),
-        ("TOPPADDING",    (0,0), (-1,-1), 9),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 9),
-        ("LEFTPADDING",   (0,0), (0,0),   10),
-        ("LEFTPADDING",   (1,0), (1,0),   8),
-        ("RIGHTPADDING",  (0,0), (-1,-1), 8),
-        ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
-        ("LINEABOVE",     (0,0), (-1,0),  2, RED),
+        ("BACKGROUND",    (1,0),(1,0),  LIGHT),
+        ("TOPPADDING",    (0,0),(-1,-1),6),
+        ("BOTTOMPADDING", (0,0),(-1,-1),6),
+        ("LEFTPADDING",   (0,0),(0,0),  10),
+        ("LEFTPADDING",   (1,0),(1,0),  8),
+        ("RIGHTPADDING",  (0,0),(-1,-1),8),
+        ("VALIGN",        (0,0),(-1,-1),"MIDDLE"),
+        ("LINEABOVE",     (0,0),(-1,0), 2, RED),
     ]))
     story.append(cta_t)
-    story.append(Spacer(1, 3*mm))
 
-    # ════════════════════════════════════════════════════════════════
-    # 8. FOOTER TEXT
-    # ════════════════════════════════════════════════════════════════
-    story.append(P(
-        '<font name="Helvetica" size="6.5" color="#6B6B6B">'
-        'SUMMITMEDIA.CO.UK'
-        '</font>',
-        alignment=TA_CENTER, leading=9,
-    ))
+    # ═══════════════════════════════════════════════════════════════
+    # 8. FOOTER
+    # ═══════════════════════════════════════════════════════════════
+    foot_t = Table(
+        [[P('<font name="Helvetica" size="6" color="#6B6B6B">SUMMITMEDIA.CO.UK</font>',
+            alignment=TA_CENTER, leading=8)]],
+        colWidths=[W], rowHeights=[ROW_FOOT],
+    )
+    foot_t.setStyle(TableStyle([
+        ("TOPPADDING",    (0,0),(-1,-1),3),
+        ("BOTTOMPADDING", (0,0),(-1,-1),0),
+        ("LEFTPADDING",   (0,0),(-1,-1),0),
+        ("RIGHTPADDING",  (0,0),(-1,-1),0),
+    ]))
+    story.append(foot_t)
 
     doc.build(story)
     return buf.getvalue()
@@ -1437,7 +1478,7 @@ with st.expander("⚠️ Site blocked by bot protection? Paste HTML manually"):
         _pc1, _pc2 = st.columns([1, 2])
         with _pc1:
             _u = st.text_input(f"URL ({_label})", key=f"paste_url_{_i}",
-                               placeholder="https://example.com/" if _i == 0 else "https://example.com/about")
+                               placeholder="https://example.com/" if _i == 0 else f"https://example.com/page-{_i+1}")
         with _pc2:
             _h = st.text_area(f"HTML ({_label})", key=f"paste_html_{_i}",
                               height=100, placeholder="<!DOCTYPE html>..." if _i == 0 else "")
