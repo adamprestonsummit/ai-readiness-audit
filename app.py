@@ -1135,29 +1135,28 @@ def build_onepager(data: dict, month_year: str) -> bytes:
     def P(markup, **kw):
         return Paragraph(markup, S("p", **kw))
 
-    # ── Fixed height budget (pts) — must fit within H ────────────────
-    # A4 usable height ~822pt with 10mm margins.
-    # Every value here is the EXACT height allocated; text beyond is clipped.
-    ROW_HDR  = 33   # logo header row
-    ROW_HERO = 50   # headline + intro paragraph
-    ROW_SCOR = 40   # score box
-    ROW_DIMS = 26   # dimension badge strip
-    ROW_WH   = 26   # each what's working / holding content row (x3)
-    ROW_WHHD = 16   # header row of what's working table
-    ROW_WINS = 24   # wins label row (needle / quick wins heading)
-    ROW_WNUM = 76   # wins content row (number + title + detail)
-    ROW_CTA  = 34   # CTA bar
-    ROW_FOOT = 12   # footer
+    # ── Fixed height budget (pts) ───────────────────────────────────
+    # Coded values are scaled so total ~= usable page height (785pt).
+    # ReportLab adds internal padding on top, so these values are tuned
+    # so the content fills the page without overflowing.
+    ROW_HDR  = 33    # logo header
+    ROW_HERO = 84    # headline + intro paragraph
+    ROW_SCOR = 84    # score box — large number + labels + verdict line
+    ROW_DIMS = 28    # dimension badge strip
+    ROW_WHHD = 29    # WH section header row
+    ROW_WH   = 94    # each WH content row (x3) — title + 3 lines detail
+    ROW_WINS = 25    # "quick wins" label row
+    ROW_WNUM = 146   # wins content row — number + title + detail
+    ROW_CTA  = 35    # CTA bar
+    ROW_FOOT = 13    # footer
 
-    # Spacers between sections (pts, not mm)
-    SP1 = 4   # after header
-    SP2 = 3   # after hero
-    SP3 = 3   # after score
-    SP4 = 3   # after dims
-    SP5 = 3   # after WH section
+    # Spacers (pts)
+    SP1 = 5   # after header
+    SP2 = 4   # after hero
+    SP3 = 4   # after score box
+    SP4 = 4   # after dims
+    SP5 = 4   # after WH section
     SP6 = 3   # after wins
-
-    # No spare distribution — keep sizes fixed so page never overflows
 
     # ═══════════════════════════════════════════════════════════════
     # HELPER: Table cell that clips content to a fixed height
@@ -1289,7 +1288,7 @@ def build_onepager(data: dict, month_year: str) -> bytes:
     GAP  = 4*mm
     HALF = (W - GAP) / 2
     # detail text char limit: ~100 chars fits 2 lines at 6.5pt within ROW_WH
-    DET_CAP = 85
+    DET_CAP = 160
 
     def build_side(items, hdr_text, hdr_color, icon, icon_color_hex):
         row_heights = [ROW_WHHD]
@@ -1355,7 +1354,7 @@ def build_onepager(data: dict, month_year: str) -> bytes:
 
     THIRD = W / 3
     # detail cap: ~115 chars fits ~3 lines at 7pt/9lead within ROW_WNUM
-    WIN_DET_CAP = 100
+    WIN_DET_CAP = 180
     win_cells = []
     for w in (wins + [{},{},{}])[:3]:
         num    = clean(w.get("number","")) if w else ""
@@ -1406,21 +1405,7 @@ def build_onepager(data: dict, month_year: str) -> bytes:
     ]))
     story.append(cta_t)
 
-    # ═══════════════════════════════════════════════════════════════
-    # 8. FOOTER
-    # ═══════════════════════════════════════════════════════════════
-    foot_t = Table(
-        [[P('<font name="Helvetica" size="6" color="#6B6B6B">SUMMITMEDIA.CO.UK</font>',
-            alignment=TA_CENTER, leading=8)]],
-        colWidths=[W], rowHeights=[ROW_FOOT],
-    )
-    foot_t.setStyle(TableStyle([
-        ("TOPPADDING",    (0,0),(-1,-1),3),
-        ("BOTTOMPADDING", (0,0),(-1,-1),0),
-        ("LEFTPADDING",   (0,0),(-1,-1),0),
-        ("RIGHTPADDING",  (0,0),(-1,-1),0),
-    ]))
-    story.append(foot_t)
+    # Footer removed — CTA bar is the final element
 
     doc.build(story)
     return buf.getvalue()
