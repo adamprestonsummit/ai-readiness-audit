@@ -1417,12 +1417,12 @@ st.markdown(f"""
 # ─── Inputs ───────────────────────────────────────────────────────────────────
 col1, col2 = st.columns([2, 1])
 with col1:
-    domain = st.text_input("Domain to audit", placeholder="e.g. healix.com")
+    domain = st.text_input("Domain to audit", placeholder="e.g. example.com")
 with col2:
     month_year = st.text_input("Audit month / year", value=datetime.now().strftime("%B %Y"))
 
 st.markdown("**Additional pages to audit** (up to 3 internal URLs, one per line)")
-extra_raw = st.text_area("", placeholder="https://healix.com/about\nhttps://healix.com/services", height=80)
+extra_raw = st.text_area("", placeholder="https://example.com/category\nhttps://example.com/product\nhttps://example.com/blog", height=80)
 extra_urls = [u for u in extra_raw.strip().splitlines() if u.strip()]
 
 with st.expander("⚠️ Site blocked by bot protection? Paste HTML manually"):
@@ -1437,7 +1437,7 @@ with st.expander("⚠️ Site blocked by bot protection? Paste HTML manually"):
         _pc1, _pc2 = st.columns([1, 2])
         with _pc1:
             _u = st.text_input(f"URL ({_label})", key=f"paste_url_{_i}",
-                               placeholder="https://cvp.com/" if _i == 0 else "https://cvp.com/about")
+                               placeholder="https://example.com/" if _i == 0 else "https://example.com/about")
         with _pc2:
             _h = st.text_area(f"HTML ({_label})", key=f"paste_html_{_i}",
                               height=100, placeholder="<!DOCTYPE html>..." if _i == 0 else "")
