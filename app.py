@@ -371,7 +371,13 @@ Score EACH page 1-10 across these 9 dimensions:
 6. ALT TEXT – image alt attribute quality and completeness
 7. CRAWL – server-rendered static HTML vs JS dependency
 8. LLM – first-hand expertise, named entities, dates, citations, authority signals
-9. CONTENT QUALITY – benefit-led writing, clear value propositions, user-focused language, answers likely user questions directly, avoids jargon-heavy or purely feature-led copy
+9. CONTENT QUALITY – Score this dimension rigorously. Most commercial pages score 3-5, not 7-9. Use these specific criteria:
+   SCORE 1-3 (Poor): Content is purely a list of features, specs, or product names with no explanation of why they matter to the buyer. No benefit statements. No answers to "why should I choose this?" or "what problem does this solve?". Thin content that simply labels things (e.g. "Thermostatic shower kit. Chrome finish. 200mm head.").
+   SCORE 4-5 (Moderate): Some benefit language present but mostly feature-led. A few "what you get" statements but little "why it matters" context. No use case or buyer scenario addressed. Standard e-commerce copy that describes rather than sells.
+   SCORE 6-7 (Good): Clearly benefit-led for most of the page. Addresses "what's in it for me" for the target buyer. Explains why features matter (e.g. not just "thermostatic" but "thermostatic control keeps water at a safe, consistent temperature"). Answers common pre-purchase questions.
+   SCORE 8-9 (Excellent): Genuinely user-centric throughout. Addresses the buyer's specific situation, problem or goal. Uses outcome language ("achieve a spa-like experience at home", "save X", "eliminate Y problem"). Anticipates and answers specific buying questions. Cites proof points (reviews, stats, expert recommendation).
+   SCORE 10: Reserved for editorial or guide content that is comprehensive, cites sources, names experts, and fully answers a user's question with no gaps.
+   IMPORTANT: A product page that simply lists specifications and says "free delivery" scores NO HIGHER than 4. A category page that lists products with no explanatory copy scores 1-2.
 
 CRITICAL RULES FOR JSON:
 - Return ONLY raw JSON. No markdown, no ```json fences, no preamble, no explanation.
