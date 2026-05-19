@@ -362,7 +362,7 @@ def fetch_pages(domain: str, extra_urls: list[str],
 AUDIT_PROMPT = """
 You are an expert AI visibility auditor. Audit the provided HTML pages exactly like a senior technical SEO and AI readiness consultant would.
 
-Score EACH page 1-10 across these 8 dimensions:
+Score EACH page 1-10 across these 9 dimensions:
 1. ARIA – landmark roles, aria-labels, accessibility for AI parsers
 2. SCHEMA – schema.org JSON-LD structured data presence and quality
 3. HEADINGS – H1-H6 hierarchy, clarity, topic signal
@@ -371,6 +371,7 @@ Score EACH page 1-10 across these 8 dimensions:
 6. ALT TEXT – image alt attribute quality and completeness
 7. CRAWL – server-rendered static HTML vs JS dependency
 8. LLM – first-hand expertise, named entities, dates, citations, authority signals
+9. CONTENT QUALITY – benefit-led writing, clear value propositions, user-focused language, answers likely user questions directly, avoids jargon-heavy or purely feature-led copy
 
 CRITICAL RULES FOR JSON:
 - Return ONLY raw JSON. No markdown, no ```json fences, no preamble, no explanation.
@@ -395,7 +396,7 @@ Return ONLY valid JSON in exactly this structure:
   "average_score": number,
   "dimension_averages": {
     "aria": number, "schema": number, "headings": number, "meta": number,
-    "links": number, "alt_text": number, "crawl": number, "llm": number
+    "links": number, "alt_text": number, "crawl": number, "llm": number, "content_quality": number
   },
   "pages": [
     {
@@ -412,7 +413,8 @@ Return ONLY valid JSON in exactly this structure:
         "links": {"score": number, "detail": "string"},
         "alt_text": {"score": number, "detail": "string"},
         "crawl": {"score": number, "detail": "string"},
-        "llm": {"score": number, "detail": "string"}
+        "llm": {"score": number, "detail": "string"},
+        "content_quality": {"score": number, "detail": "string"}
       },
       "specific_findings": ["string", "string", "string"]
     }
@@ -445,9 +447,9 @@ Return ONLY valid JSON in exactly this structure:
 }
 
 IMPORTANT SCORING RULES:
-- Each page "score" is the SUM of its 8 dimension scores (each 1-10), so the maximum is 80.
-- "average_score" is the average of all page scores (i.e. average of those sums), so it is also out of 80. Do NOT return the average of dimension averages — that would give a number out of 10, which is wrong.
-- Example: if one page scores aria:6, schema:2, headings:7, meta:8, links:6, alt_text:4, crawl:8, llm:7 — its score is 48/80, not 6/10.
+- Each page "score" is the SUM of its 9 dimension scores (each 1-10), so the maximum is 90.
+- "average_score" is the average of all page scores (i.e. average of those sums), so it is also out of 90. Do NOT return the average of dimension averages — that would give a number out of 10, which is wrong.
+- Example: if one page scores aria:6, schema:2, headings:7, meta:8, links:6, alt_text:4, crawl:8, llm:7, content_quality:5 — its score is 53/90, not 6/10.
 - "dimension_averages" are the averages of each dimension across all pages, each still out of 10.
 
 IMPORTANT: The "recommendations" array MUST contain 8-12 items ranked by impact. Every audit has recommendations.
@@ -534,22 +536,24 @@ def run_audit(model, pages: dict) -> dict:
         dim_keys = ["aria","schema","headings","meta","links","alt_text","crawl","llm"]
         dim_labels = ["ARIA","SCHEMA","HEADINGS","META","LINKS","ALT TEXT","CRAWL","LLM"]
         action_map = {
-            "schema":   ("Ship schema.org JSON-LD structured data sitewide",
-                         "Very high — biggest single AI citation unlock", "Low — template insert", "Dev"),
-            "aria":     ("Add ARIA landmark roles to navigation and content regions",
-                         "Medium — improves AI page structure parsing", "Low — template tweak", "Dev"),
-            "alt_text": ("Audit and fix all image alt attributes",
-                         "High — dual accessibility and AI win", "Low — CMS field fix", "Content"),
-            "headings": ("Ensure every page has a unique, descriptive H1",
-                         "High — primary topic signal for AI crawlers", "Low — template fix", "Dev"),
-            "links":    ("Normalise internal links to consistent https:// protocol",
-                         "Medium — removes redirect noise for crawlers", "Medium — site-wide pass", "Dev"),
-            "meta":     ("Add bespoke meta description to every page",
-                         "Medium — strengthens per-page topic signal", "Low — content pass", "Content"),
-            "crawl":    ("Audit JS-dependent content and ensure static HTML fallbacks",
-                         "High — critical for AI crawler access", "High — architecture review", "Dev"),
-            "llm":      ("Add named experts, dates and first-hand detail to key pages",
-                         "High — converts pages into citable authority content", "Medium — content pass", "Content"),
+            "schema":          ("Ship schema.org JSON-LD structured data sitewide",
+                                "Very high — biggest single AI citation unlock", "Low — template insert", "Dev"),
+            "aria":            ("Add ARIA landmark roles to navigation and content regions",
+                                "Medium — improves AI page structure parsing", "Low — template tweak", "Dev"),
+            "alt_text":        ("Audit and fix all image alt attributes",
+                                "High — dual accessibility and AI win", "Low — CMS field fix", "Content"),
+            "headings":        ("Ensure every page has a unique, descriptive H1",
+                                "High — primary topic signal for AI crawlers", "Low — template fix", "Dev"),
+            "links":           ("Normalise internal links to consistent https:// protocol",
+                                "Medium — removes redirect noise for crawlers", "Medium — site-wide pass", "Dev"),
+            "meta":            ("Add bespoke meta description to every page",
+                                "Medium — strengthens per-page topic signal", "Low — content pass", "Content"),
+            "crawl":           ("Audit JS-dependent content and ensure static HTML fallbacks",
+                                "High — critical for AI crawler access", "High — architecture review", "Dev"),
+            "llm":             ("Add named experts, dates and first-hand detail to key pages",
+                                "High — converts pages into citable authority content", "Medium — content pass", "Content"),
+            "content_quality": ("Rewrite key pages to lead with user benefits rather than features",
+                                "High — benefit-led content is more likely to be cited by AI in answers", "Medium — content rewrite", "Content"),
         }
         # Find lowest-scoring dimensions across all pages
         avg_scores = result.get("dimension_averages", {})
@@ -585,7 +589,7 @@ def run_audit(model, pages: dict) -> dict:
         ]
 
     # ── Always recalculate scores from dimension data (don't trust Gemini's maths) ──
-    dim_keys = ["aria", "schema", "headings", "meta", "links", "alt_text", "crawl", "llm"]
+    dim_keys = ["aria", "schema", "headings", "meta", "links", "alt_text", "crawl", "llm", "content_quality"]
     for page in result.get("pages", []):
         dims = page.get("dimensions", {})
         dim_scores = [dims.get(dk, {}).get("score", 0) for dk in dim_keys]
@@ -619,8 +623,8 @@ def build_docx(data: dict, month_year: str) -> bytes:
     """
     import tempfile, os, subprocess, json as _json
 
-    dim_keys   = ["aria","schema","headings","meta","links","alt_text","crawl","llm"]
-    dim_labels = ["ARIA","SCHEMA","HEADINGS","META","LINKS","ALT TEXT","CRAWL","LLM"]
+    dim_keys   = ["aria","schema","headings","meta","links","alt_text","crawl","llm","content_quality"]
+    dim_labels = ["ARIA","SCHEMA","HEADINGS","META","LINKS","ALT TEXT","CRAWL","LLM","CONTENT"]
 
     def score_color_hex(s):
         if s <= 2: return "C0392B"
@@ -791,7 +795,7 @@ pages.forEach(function(p, i) {
   const shade = { shading: { fill, type: ShadingType.CLEAR } };
   scorecardRows.push(new TableRow({ children: [
     cell([para([txt(p.title || ('Page '+(i+1)), { bold: true, size: 18 })])], 3500, shade),
-    cell([para([txt((p.score||0)+'/80', { bold: true, size: 18 })], { alignment: AlignmentType.CENTER })], 900, shade),
+    cell([para([txt((p.score||0)+'/90', { bold: true, size: 18 })], { alignment: AlignmentType.CENTER })], 900, shade),
     cell([para([txt(p.verdict || '', { size: 18 })])], 4960, shade),
   ]}));
 });
@@ -801,9 +805,9 @@ const dimAvgCells = dimKeys.map(function(dk, i) {
   const s = dimAvg[dk] || 0;
   const col = dimColors[dk] || '27AE60';
   return cell([
-    para([txt(dimLabels[i], { size: 14, bold: true, color: 'FFFFFF' })], { alignment: AlignmentType.CENTER }),
-    para([txt(s+'/10', { size: 24, bold: true, color: 'FFFFFF' })], { alignment: AlignmentType.CENTER }),
-  ], 1170, { shading: { fill: col, type: ShadingType.CLEAR } });
+    para([txt(dimLabels[i], { size: 13, bold: true, color: 'FFFFFF' })], { alignment: AlignmentType.CENTER }),
+    para([txt(s+'/10', { size: 22, bold: true, color: 'FFFFFF' })], { alignment: AlignmentType.CENTER }),
+  ], 1040, { shading: { fill: col, type: ShadingType.CLEAR } });
 });
 
 // ── Per-page sections ────────────────────────────────────────────────────────
@@ -831,7 +835,7 @@ pages.forEach(function(p, i) {
     para([txt('PAGE '+(i+1)+': '+(p.title||'').toUpperCase(), { size: 28, bold: true, color: 'D93B1A' })],
       { heading: HeadingLevel.HEADING_1 }),
     para([txt('URL: ', { bold: true, size: 20 }), txt(p.url||'', { size: 20, color: 'D93B1A' })]),
-    para([txt('Total score: '+(p.score||0)+'/80', { bold: true, size: 20 })]),
+    para([txt('Total score: '+(p.score||0)+'/90', { bold: true, size: 20 })]),
     para([txt(p.headline_finding || '', { size: 20, italics: true })], {
       spacing: { before: 160 },
       border: { left: { style: BorderStyle.SINGLE, size: 20, color: 'D93B1A' } },
@@ -993,7 +997,7 @@ const doc = new Document({
       para([txt('Dimension Averages', { size: 24, bold: true })], { heading: HeadingLevel.HEADING_2, spacing: { before: 320 } }),
       new Table({
         width: { size: 9360, type: WidthType.DXA },
-        columnWidths: [1170, 1170, 1170, 1170, 1170, 1170, 1170, 1170],
+        columnWidths: [1040, 1040, 1040, 1040, 1040, 1040, 1040, 1040, 1040],
         rows: [new TableRow({ children: dimAvgCells })]
       }),
       para([new PageBreak()]),
@@ -1010,6 +1014,7 @@ const doc = new Document({
           'Image alt text. Descriptive alt attributes \u2014 the cheapest accessibility-and-AI dual win available.',
           'Crawlability and JS dependency. Whether content is present in static HTML or requires JS execution.',
           'LLM content signals. First-hand expertise, named authors, dates, citations, accreditations.',
+          'Content quality. Benefit-led writing, clear value propositions, user-focused language, and direct answers to likely user questions.',
       ].map(function(t) { return para([txt(t, { size: 20 })], { numbering: { reference: 'bullets', level: 0 } }); }),
       para([txt('Scoring Bands', { size: 24, bold: true })], { heading: HeadingLevel.HEADING_2 }),
       para([txt('Red (1\u20132): Critical. Actively blocking AI visibility. Fix first.', { size: 20 })], { numbering: { reference: 'bullets', level: 0 } }),
@@ -1085,8 +1090,8 @@ def build_onepager(data: dict, month_year: str) -> bytes:
     holding      = data.get("whats_holding_back", [])[:3]
     wins         = data.get("three_quick_wins", [])[:3]
 
-    dim_keys   = ["aria","schema","headings","meta","links","alt_text","crawl","llm"]
-    dim_labels = ["ARIA","SCHEMA","HEADINGS","META","LINKS","ALT TEXT","CRAWL","LLM"]
+    dim_keys   = ["aria","schema","headings","meta","links","alt_text","crawl","llm","content_quality"]
+    dim_labels = ["ARIA","SCHEMA","HEADINGS","META","LINKS","ALT TEXT","CRAWL","LLM","CONTENT"]
 
     RED   = colors.HexColor("#D93B1A")
     DARK  = colors.HexColor("#1A1A1A")
@@ -1241,7 +1246,7 @@ def build_onepager(data: dict, month_year: str) -> bytes:
 
     score_t = Table(
         [[P(f'<font name="Helvetica-Bold" size="36" color="#D93B1A">{avg}</font>'
-            f'<font name="Helvetica" size="12" color="#6B6B6B">/80</font>',
+            f'<font name="Helvetica" size="12" color="#6B6B6B">/90</font>',
             alignment=TA_CENTER, leading=40),
           P(label_html, leading=13)]],
         colWidths=[34*mm, W - 34*mm],
@@ -1262,17 +1267,17 @@ def build_onepager(data: dict, month_year: str) -> bytes:
     # ═══════════════════════════════════════════════════════════════
     # 4. DIMENSION BADGES  — fixed height
     # ═══════════════════════════════════════════════════════════════
-    cw = W / 8
+    cw = W / 9
     dim_cells = []
     for dk, dl in zip(dim_keys, dim_labels):
         s = dim_avg.get(dk, 0)
         dim_cells.append(P(
-            f'<font name="Helvetica" size="5" color="#FFFFFF">{dl}<br/></font>'
-            f'<font name="Helvetica-Bold" size="11" color="#FFFFFF">{s}</font>'
-            f'<font name="Helvetica" size="6" color="#FFFFFF">/10</font>',
+            f'<font name="Helvetica" size="4.5" color="#FFFFFF">{dl}<br/></font>'
+            f'<font name="Helvetica-Bold" size="10" color="#FFFFFF">{s}</font>'
+            f'<font name="Helvetica" size="5.5" color="#FFFFFF">/10</font>',
             alignment=TA_CENTER, leading=9,
         ))
-    dim_t = Table([dim_cells], colWidths=[cw]*8, rowHeights=[ROW_DIMS])
+    dim_t = Table([dim_cells], colWidths=[cw]*9, rowHeights=[ROW_DIMS])
     ds = [("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
           ("LEFTPADDING",(0,0),(-1,-1),1),("RIGHTPADDING",(0,0),(-1,-1),1)]
     for i, dk in enumerate(dim_keys):
@@ -1545,8 +1550,8 @@ if "audit" in st.session_state:
     company  = audit.get("company_name", domain)
     avg      = round(audit.get("average_score", 0))
     dim_avg  = audit.get("dimension_averages", {})
-    dim_keys   = ["aria","schema","headings","meta","links","alt_text","crawl","llm"]
-    dim_labels = ["ARIA","SCHEMA","HEADINGS","META","LINKS","ALT TEXT","CRAWL","LLM"]
+    dim_keys   = ["aria","schema","headings","meta","links","alt_text","crawl","llm","content_quality"]
+    dim_labels = ["ARIA","SCHEMA","HEADINGS","META","LINKS","ALT TEXT","CRAWL","LLM","CONTENT"]
 
     st.markdown(f"## 📊 Results: {company}")
 
@@ -1557,7 +1562,7 @@ if "audit" in st.session_state:
         <div class="score-card">
           <div style="font-size:0.7rem;font-weight:600;color:{SUMMIT_GREY};letter-spacing:1px">AVERAGE PAGE SCORE</div>
           <div class="score-big">{avg}</div>
-          <div style="color:{SUMMIT_GREY}">/80</div>
+          <div style="color:{SUMMIT_GREY}">/90</div>
         </div>""", unsafe_allow_html=True)
 
     with c2:
@@ -1599,7 +1604,7 @@ if "audit" in st.session_state:
         tabs = st.tabs([p.get("title", f"Page {i+1}") for i, p in enumerate(pages_data)])
         for tab, page in zip(tabs, pages_data):
             with tab:
-                st.markdown(f"**Score:** {page.get('score',0)}/80 &nbsp;|&nbsp; *{page.get('verdict','')}*")
+                st.markdown(f"**Score:** {page.get('score',0)}/90 &nbsp;|&nbsp; *{page.get('verdict','')}*")
                 st.info(page.get("headline_finding",""))
                 dims = page.get("dimensions", {})
                 rows = []
