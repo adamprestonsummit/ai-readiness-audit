@@ -1200,7 +1200,7 @@ def build_onepager(data: dict, month_year: str) -> bytes:
     else:
         intro_raw = clean(exec_summary)
     # 165 chars fits ~2 lines at 7pt/9lead within ROW_HERO
-    intro_txt = intro_raw[:165] + ("..." if len(intro_raw) > 165 else "")
+    intro_txt = intro_raw  # no cap — hero row height clips naturally
 
     hero_t = Table(
         [[P('<font name="Helvetica-Bold" size="17">Is your site ready '
@@ -1228,7 +1228,7 @@ def build_onepager(data: dict, month_year: str) -> bytes:
         for part in exec_summary.split("|"):
             if "VERDICT:" in part.upper():
                 ci = part.find(":")
-                verdict_text = clean(part[ci+1:].strip())[:140] if ci != -1 else ""
+                verdict_text = clean(part[ci+1:].strip()) if ci != -1 else ""
                 break
 
     label_html = (
@@ -1288,7 +1288,7 @@ def build_onepager(data: dict, month_year: str) -> bytes:
     GAP  = 4*mm
     HALF = (W - GAP) / 2
     # detail text char limit: ~100 chars fits 2 lines at 6.5pt within ROW_WH
-    DET_CAP = 160
+    DET_CAP = 999  # no cap — row height clips naturally
 
     def build_side(items, hdr_text, hdr_color, icon, icon_color_hex):
         row_heights = [ROW_WHHD]
@@ -1354,7 +1354,7 @@ def build_onepager(data: dict, month_year: str) -> bytes:
 
     THIRD = W / 3
     # detail cap: ~115 chars fits ~3 lines at 7pt/9lead within ROW_WNUM
-    WIN_DET_CAP = 180
+    WIN_DET_CAP = 999  # no cap — row height clips naturally
     win_cells = []
     for w in (wins + [{},{},{}])[:3]:
         num    = clean(w.get("number","")) if w else ""
