@@ -1784,3 +1784,108 @@ if "audit" in st.session_state:
             st.session_state.pop(k, None)
         st.rerun()
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# SCHEMA SCORER TEST HARNESS
+# Paste this near the bottom of app.py, above any final st.stop() or similar.
+# Wrapped in an expander so it doesn't clutter the main audit UI.
+# Requires schema_scorer.py to be in the same directory as app.py.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+with st.expander("🧪 Schema scorer test bench (internal)"):
+    st.markdown(
+        "Paste raw HTML from a page (View Page Source in the browser, then "
+        "Ctrl+A / Ctrl+C), pick the page type, and see how the deterministic "
+        "SCHEMA scorer would score it. Nothing here runs the main audit or "
+        "calls Gemini. This is for validating the scorer before it goes live."
+    )
+
+    _test_url = st.text_input(
+        "URL (optional, for your reference only)",
+        key="schema_test_url",
+        placeholder="https://www.bettys.co.uk/",
+    )
+
+    _test_page_type = st.selectbox(
+        "Page type",
+        options=["homepage", "category", "product", "article", "other"],
+        key="schema_test_page_type",
+        help=(
+            "homepage = site homepage. "
+            "category = PLP / listing page. "
+            "product = PDP. "
+            "article = blog post or editorial. "
+            "other = about, contact, help, hub pages."
+        ),
+    )
+
+    _test_html = st.text_area(
+        "Raw HTML",
+        key="schema_test_html",
+        height=200,
+        placeholder="Paste the page's raw HTML here...",
+    )
+
+    if st.button("Score schema", key="schema_test_button"):
+        if not _test_html.strip():
+            st.warning("Paste some HTML first.")
+        else:
+            try:
+                from schema_scorer import score_schema
+                _result = score_schema(_test_html, _test_page_type)
+
+                # Colour the score box based on the band
+                _score = _result["score"]
+                if _score <= 2:
+                    _colour = "#C0392B"
+                    _band = "Poor"
+                elif _score <= 5:
+                    _colour = "#B8800F"
+                    _band = "Needs improvement"
+                else:
+                    _colour = "#276749"
+                    _band = "Good"
+
+                st.markdown(
+                    f"""
+                    <div style="background:{_colour}; color:white; padding:16px 20px;
+                                border-radius:8px; margin-top:12px;">
+                        <div style="font-size:14px; text-transform:uppercase;
+                                    letter-spacing:0.1em; opacity:0.85;">
+                            SCHEMA score
+                        </div>
+                        <div style="font-size:36px; font-weight:900; line-height:1;">
+                            {_score}/10
+                        </div>
+                        <div style="font-size:14px; margin-top:6px;">
+                            {_band}
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                st.markdown("**Human-readable finding:**")
+                st.write(_result["detail"])
+
+                st.markdown("**Evidence (what the scorer saw):**")
+                st.json(_result["evidence"])
+
+                # Sanity-check display: raw JSON-LD block count
+                import re as _re
+                _raw_count = len(_re.findall(
+                    r'<script[^>]+type=["\']application/ld\+json["\']',
+                    _test_html, _re.IGNORECASE
+                ))
+                st.caption(
+                    f"Sanity check: {_raw_count} JSON-LD script tags found in raw HTML. "
+                    f"Scorer parsed {_result['evidence']['total_blocks']} valid blocks "
+                    f"and rejected {_result['evidence']['invalid_blocks']} invalid."
+                )
+            except ImportError:
+                st.error(
+                    "schema_scorer.py is not in the same directory as app.py. "
+                    "Add it to the repo before using the test bench."
+                )
+            except Exception as e:
+                st.error(f"Scorer error: {e}")
+                st.exception(e)
