@@ -56,6 +56,7 @@ def extract_page_signals(url: str, html: str) -> str:
     what an AI auditor needs: meta, schema, headings, links, alt text, ARIA.
     This keeps each page under ~2000 tokens while preserving all audit signals.
     """
+    import re as _re
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript", "svg", "path"]):
         tag.decompose()
@@ -104,7 +105,6 @@ def extract_page_signals(url: str, html: str) -> str:
     # Extract every date-like value from schema markup and meta tags,
     # then label each as PAST or FUTURE against today's real date.
     # This means Gemini never has to decide "is 2026 in the future?".
-    import re as _re
     from datetime import date as _date
     today = _date.today()
     date_findings = []
@@ -225,11 +225,59 @@ def extract_page_signals(url: str, html: str) -> str:
         except Exception:
             pass
 
-    # ── Body content sample (for LLM signal) ─────────────────────────
+    # ── Body content sample (for LLM & CONTENT signal) ───────────────
+    # Priority order: prefer <main>, then <article>, then a #content /
+    # role="main" container, then finally fall back to <body> minus the
+    # nav/header/footer. This ensures we sample the ACTUAL page content
+    # (product descriptions, article body, etc.) not the mega-menu.
+    body_sample = ""
+    main_candidates = []
+
+    # Try semantic containers first
+    for selector in [
+        {"name": "main"},
+        {"name": "article"},
+        {"attrs": {"role": "main"}},
+        {"attrs": {"id": _re.compile(r"main|content|product", _re.I)}},
+        {"attrs": {"class": _re.compile(r"product-description|product-details|product__description|main-content|page-content|article-body|entry-content|post-content", _re.I)}},
+    ]:
+        try:
+            found = soup.find_all(**selector)
+        except Exception:
+            found = []
+        for f in found:
+            txt = " ".join(f.get_text(" ", strip=True).split())
+            if len(txt) > 100:
+                main_candidates.append(txt)
+        if main_candidates:
+            break
+
+    if main_candidates:
+        # Use the longest main candidate — biggest content block wins
+        main_candidates.sort(key=len, reverse=True)
+        body_sample = main_candidates[0][:3500]
+        out.append(f"MAIN_CONTENT (from semantic container):\n{body_sample}")
+    else:
+        # Fallback: full body minus nav/header/footer/aside
+        body = soup.find("body")
+        if body:
+            body_copy = BeautifulSoup(str(body), "html.parser")
+            for junk in body_copy(["nav","header","footer","aside","form"]):
+                junk.decompose()
+            # Also strip common nav/footer class patterns
+            for junk in body_copy.find_all(
+                attrs={"class": _re.compile(r"nav|menu|header|footer|cookie|banner|breadcrumb|sidebar", _re.I)}
+            ):
+                junk.decompose()
+            text = " ".join(body_copy.get_text(" ", strip=True).split())[:3500]
+            out.append(f"BODY_TEXT_SAMPLE (nav stripped):\n{text}")
+
+    # Also include a shorter raw body sample so Gemini can still audit
+    # nav content signals like "Shop by Category" etc.
     body = soup.find("body")
     if body:
-        text = " ".join(body.get_text(" ", strip=True).split())[:1500]
-        out.append(f"BODY_TEXT_SAMPLE:\n{text}")
+        raw_snippet = " ".join(body.get_text(" ", strip=True).split())[:800]
+        out.append(f"RAW_BODY_START (first 800 chars including nav):\n{raw_snippet}")
 
     return "\n\n".join(out)
 
@@ -529,6 +577,8 @@ Score EACH page 1-10 across these 9 dimensions:
    SCORE 8-9 (Excellent): Genuinely user-centric throughout. Addresses the buyer's specific situation, problem or goal. Uses outcome language ("achieve a spa-like experience at home", "save X", "eliminate Y problem"). Anticipates and answers specific buying questions. Cites proof points (reviews, stats, expert recommendation).
    SCORE 10: Reserved for editorial or guide content that is comprehensive, cites sources, names experts, and fully answers a user's question with no gaps.
    IMPORTANT: A product page that simply lists specifications and says "free delivery" scores NO HIGHER than 4. A category page that lists products with no explanatory copy scores 1-2.
+
+   CRITICAL SCORING RULE: Score ONLY on the content you can actually see in the MAIN_CONTENT and BODY_TEXT_SAMPLE fields. Do NOT assume, infer, or hope that expanded content exists beyond what is shown. If the extracted content is thin, the page IS thin — score it accordingly. Never write phrases like "assuming the full description expands on this" or "if the page includes more detail" — if you did not see the content, it does not count. If a product page's visible content is just the product name, price, and a spec list, score 1-3 regardless of what OG or schema description says. Meta and schema descriptions are marketing summaries, they are NOT the on-page content and do not count toward CONTENT QUALITY scoring.
 
 CRITICAL RULES FOR JSON:
 - Return ONLY raw JSON. No markdown, no ```json fences, no preamble, no explanation.
