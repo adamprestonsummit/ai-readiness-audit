@@ -101,13 +101,31 @@ def extract_page_signals(url: str, html: str) -> str:
     out.append("SCHEMA_JSON_LD: " + ("; ".join(schemas) if schemas else "NONE FOUND"))
 
     # ── Heading structure ─────────────────────────────────────────────
-    headings = []
+    # Collect headings by level so H1s are never crowded out by nav H2/H3s.
+    # Also include an H1 count so Gemini can spot multiple-H1 problems.
+    heads_by_level = {"h1": [], "h2": [], "h3": [], "h4": []}
     for tag in soup.find_all(["h1","h2","h3","h4"]):
-        txt = tag.get_text(" ", strip=True)[:80]
-        if txt:
-            headings.append(f"<{tag.name}>{txt}</{tag.name}>")
-        if len(headings) >= 20: break
-    out.append("HEADINGS:\n" + ("\n".join(headings) if headings else "NONE FOUND"))
+        txt = tag.get_text(" ", strip=True)[:100]
+        if txt and tag.name in heads_by_level:
+            heads_by_level[tag.name].append(txt)
+
+    # Fallback: some CMSs use role="heading" with aria-level instead of real h1-h6
+    if not heads_by_level["h1"]:
+        for tag in soup.find_all(attrs={"role":"heading"}):
+            level = tag.get("aria-level","1")
+            txt = tag.get_text(" ", strip=True)[:100]
+            if txt and str(level) == "1":
+                heads_by_level["h1"].append(txt + " [role=heading aria-level=1]")
+
+    h1_count = len(heads_by_level["h1"])
+    heading_lines = [f"H1 COUNT: {h1_count}"]
+    for lvl in ["h1","h2","h3","h4"]:
+        # Always include ALL h1s; cap h2/h3/h4 at 8 each so we don't blow the budget
+        cap = None if lvl == "h1" else 8
+        items = heads_by_level[lvl][:cap] if cap else heads_by_level[lvl]
+        for txt in items:
+            heading_lines.append(f"<{lvl}>{txt}</{lvl}>")
+    out.append("HEADINGS:\n" + ("\n".join(heading_lines) if h1_count or any(heads_by_level.values()) else "NONE FOUND"))
 
     # ── ARIA usage ────────────────────────────────────────────────────
     aria_items = []
