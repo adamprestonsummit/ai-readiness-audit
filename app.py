@@ -115,11 +115,22 @@ def extract_page_signals(url: str, html: str) -> str:
         # Fields where we expand nested sub-fields so Gemini can see what is
         # actually populated, instead of just the nested @type (which hides
         # completeness and causes false "incomplete" flags).
-        NESTED_FIELDS_TO_EXPAND = {
-            "address":   ["streetAddress","addressLocality","addressRegion","postalCode","addressCountry"],
-            "offers":    ["price","priceCurrency","availability","url","priceValidUntil"],
-            "author":    ["name","url"],
-            "publisher": ["name","url","logo"],
+        # Fields where we expand nested sub-fields so Gemini can see what is
+        # actually populated. Only REQUIRED sub-fields are ever reported as
+        # "missing" — optional ones are simply omitted when absent, so the
+        # word "missing" only appears for genuine gaps, not for fields most
+        # sites never populate (e.g. priceValidUntil, author url, publisher logo).
+        NESTED_FIELDS_REQUIRED = {
+            "address":   ["streetAddress","addressLocality","postalCode","addressCountry"],
+            "offers":    ["price","priceCurrency","availability"],
+            "author":    ["name"],
+            "publisher": ["name"],
+        }
+        NESTED_FIELDS_OPTIONAL = {
+            "address":   ["addressRegion"],
+            "offers":    ["url","priceValidUntil"],
+            "author":    ["url"],
+            "publisher": ["url","logo"],
         }
 
         useful = []
@@ -131,14 +142,17 @@ def extract_page_signals(url: str, html: str) -> str:
                 if isinstance(v, (dict, list)):
                     if k == "itemListElement" and isinstance(v, list):
                         useful.append(f"{k}=[{len(v)} items]")
-                    elif isinstance(v, dict) and k in NESTED_FIELDS_TO_EXPAND:
-                        sub_fields = NESTED_FIELDS_TO_EXPAND[k]
-                        present = [sf for sf in sub_fields if v.get(sf)]
-                        missing = [sf for sf in sub_fields if not v.get(sf)]
+                    elif isinstance(v, dict) and k in NESTED_FIELDS_REQUIRED:
+                        required = NESTED_FIELDS_REQUIRED[k]
+                        optional = NESTED_FIELDS_OPTIONAL.get(k, [])
+                        present_req = [sf for sf in required if v.get(sf)]
+                        missing_req = [sf for sf in required if not v.get(sf)]
+                        present_opt = [sf for sf in optional if v.get(sf)]
                         nested_type = v.get("@type", "?")
-                        detail = f"present: {', '.join(present) if present else 'none'}"
-                        if missing:
-                            detail += f" | missing: {', '.join(missing)}"
+                        all_present = present_req + present_opt
+                        detail = f"present: {', '.join(all_present) if all_present else 'none'}"
+                        if missing_req:
+                            detail += f" | missing required: {', '.join(missing_req)}"
                         useful.append(f"{k}={{{nested_type}: {detail}}}")
                     elif isinstance(v, dict):
                         useful.append(f"{k}={{{v.get('@type','?')}}}")
@@ -653,12 +667,8 @@ The value {TODAY_DATE} at the end of the "Pages to audit" section is the current
 Score EACH page 1-10 across these 9 dimensions:
 1. ARIA – landmark roles, aria-labels, accessibility for AI parsers
 2. SCHEMA – schema.org JSON-LD structured data presence and quality.
-   The schema summary shows nested objects (address, offers, author, publisher) with their sub-fields explicitly marked as "present" or "missing". Base completeness judgements ONLY on fields explicitly listed as missing. Do NOT infer a field is missing or a stub just because a nested object is shown compactly (e.g. as {PostalAddress: ...}), that compact form is a display convention, not a sign of incompleteness.
-   Reference for what counts as a complete nested object:
-     - address (PostalAddress): complete if streetAddress, addressLocality, postalCode and addressCountry are all present. addressRegion is optional in the UK and its absence alone does not make the address incomplete.
-     - offers: complete if price, priceCurrency and availability are present.
-     - author / publisher: complete if name is present at minimum; url and logo (for publisher) are enhancements, not requirements.
-   If a nested object's "missing" list is empty, treat that field as fully complete and do not describe it as a stub, placeholder or incomplete in your findings.
+   The schema summary shows nested objects (address, offers, author, publisher) with a "present" list and, only when relevant, a "missing required" list. Optional sub-fields (e.g. addressRegion, priceValidUntil, author/publisher url, publisher logo) are never listed as missing, they are simply included in "present" when populated and left out entirely when absent. This means a nested object with no "missing required" entry is fully complete, do not describe it as a stub, placeholder or incomplete. Base every completeness judgement strictly on the "missing required" list, and treat anything not flagged there as complete.
+   Each SCHEMA_JSON_LD block is a compressed summary, not truncated raw JSON, the header explicitly says so. Do NOT report schema as "truncated" based on the summary format itself.
 3. HEADINGS – H1-H6 hierarchy, clarity, topic signal
 4. META – Score based on what AI crawlers actually use, not social sharing signals. Use these criteria:
    HIGH-WEIGHT signals (drive most of the score): unique descriptive <title>, meta description, canonical URL, lang attribute, robots directive, viewport. These are what AI crawlers use to understand and cite a page.
