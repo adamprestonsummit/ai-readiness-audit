@@ -86,20 +86,98 @@ def extract_page_signals(url: str, html: str) -> str:
     out.append("META:\n" + "\n".join(meta_items[:20] + link_tags[:5]))
 
     # ── Schema / JSON-LD ──────────────────────────────────────────────
+    # Instead of sending truncated raw JSON (which makes Gemini incorrectly
+    # flag pages as having "truncated schema"), we summarise each schema
+    # block: type, key fields, and validity. This works even for PLPs with
+    # dozens of Product schemas — each is summarised, not truncated.
+    import json as _json
+
+    def _schema_summary(obj, depth=0):
+        """Return a short human summary of a schema.org object."""
+        if depth > 3:
+            return "..."
+        if isinstance(obj, list):
+            # ItemList / array — summarise count and first item's type
+            if not obj:
+                return "empty list"
+            first_type = "?"
+            if isinstance(obj[0], dict):
+                first_type = obj[0].get("@type", "?")
+            return f"list of {len(obj)} items (first @type={first_type})"
+        if not isinstance(obj, dict):
+            return type(obj).__name__
+        typ = obj.get("@type", "?")
+        # Handle @graph — array of nested schemas
+        if "@graph" in obj and isinstance(obj["@graph"], list):
+            types_in_graph = [g.get("@type","?") if isinstance(g,dict) else "?" for g in obj["@graph"]]
+            return f"@graph with {len(obj['@graph'])} nodes: {', '.join(types_in_graph[:10])}"
+        # Extract useful fields based on type
+        useful = []
+        for k in ["name","headline","url","description","datePublished","dateModified",
+                  "author","publisher","offers","aggregateRating","brand","sku",
+                  "image","logo","email","telephone","address","itemListElement"]:
+            if k in obj:
+                v = obj[k]
+                if isinstance(v, (dict, list)):
+                    if k == "itemListElement" and isinstance(v, list):
+                        useful.append(f"{k}=[{len(v)} items]")
+                    elif isinstance(v, dict):
+                        useful.append(f"{k}={{{v.get('@type','?')}}}")
+                    else:
+                        useful.append(f"{k}=[{len(v)}]")
+                else:
+                    val = str(v)[:60]
+                    useful.append(f"{k}='{val}'")
+        return f"@type={typ}" + ((" " + ", ".join(useful)) if useful else "")
+
+    def _parse_json_loose(txt):
+        """Try to parse JSON, stripping common issues (comments, trailing commas)."""
+        txt = txt.strip()
+        try:
+            return _json.loads(txt)
+        except _json.JSONDecodeError:
+            # Try stripping trailing commas
+            cleaned = _re.sub(r",\s*([}\]])", r"\1", txt)
+            try:
+                return _json.loads(cleaned)
+            except _json.JSONDecodeError:
+                return None
+
     schemas = []
-    for s in soup.find_all("script", attrs={"type": "application/ld+json"}):
-        txt = s.string or s.get_text()
-        if txt and txt.strip():
-            schemas.append(txt.strip()[:500])
-    # Fallback: regex search raw HTML in case BeautifulSoup missed it
-    if not schemas:
-        import re as _re
-        raw_schemas = _re.findall(
+    schema_scripts = list(soup.find_all("script", attrs={"type": "application/ld+json"}))
+    # Fallback: raw HTML regex if BeautifulSoup missed any
+    raw_blocks = []
+    if not schema_scripts:
+        raw_blocks = _re.findall(
             r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
             html, _re.DOTALL | _re.IGNORECASE
         )
-        schemas = [s.strip()[:500] for s in raw_schemas if s.strip()]
-    out.append("SCHEMA_JSON_LD: " + ("; ".join(schemas) if schemas else "NONE FOUND"))
+
+    schema_sources = [(s.string or s.get_text()) for s in schema_scripts] or raw_blocks
+    total_blocks = len(schema_sources)
+
+    for i, raw_txt in enumerate(schema_sources):
+        if not raw_txt or not raw_txt.strip():
+            continue
+        parsed = _parse_json_loose(raw_txt)
+        if parsed is None:
+            # Note the parse error — this IS a real signal Gemini should see
+            schemas.append(f"BLOCK {i+1}: PARSE_ERROR (invalid JSON, {len(raw_txt)} chars)")
+        else:
+            if isinstance(parsed, list):
+                summary = _schema_summary(parsed)
+                schemas.append(f"BLOCK {i+1}: {summary}")
+            else:
+                summary = _schema_summary(parsed)
+                schemas.append(f"BLOCK {i+1}: {summary}")
+
+    if schemas:
+        out.append(
+            f"SCHEMA_JSON_LD ({total_blocks} block(s) found, all summarised — NOT truncated):\n"
+            + "\n".join(schemas)
+        )
+    else:
+        out.append("SCHEMA_JSON_LD: NONE FOUND")
 
     # ── Pre-labelled dates ────────────────────────────────────────────
     # Extract every date-like value from schema markup and meta tags,
