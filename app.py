@@ -450,7 +450,15 @@ Score EACH page 1-10 across these 9 dimensions:
 1. ARIA – landmark roles, aria-labels, accessibility for AI parsers
 2. SCHEMA – schema.org JSON-LD structured data presence and quality
 3. HEADINGS – H1-H6 hierarchy, clarity, topic signal
-4. META – title, description, canonical, Open Graph, Twitter Card
+4. META – Score based on what AI crawlers actually use, not social sharing signals. Use these criteria:
+   HIGH-WEIGHT signals (drive most of the score): unique descriptive <title>, meta description, canonical URL, lang attribute, robots directive, viewport. These are what AI crawlers use to understand and cite a page.
+   LOW-WEIGHT signals (should contribute at most 1-2 points): Open Graph tags (og:title, og:description, og:image, og:type), Twitter Card tags. These are for social media previews, not AI citation. A page with only OG tags but no proper title or description should score 3-4, not 7-8.
+   SCORE 1-3 (Poor): Missing title, no meta description, no canonical, or duplicate meta across many pages.
+   SCORE 4-5 (Moderate): Has title and description but they are generic, templated, or missing canonical. OG tags present but core meta weak.
+   SCORE 6-7 (Good): Bespoke title and description per page, correct canonical, proper lang, robots configured. OG tags present as a bonus.
+   SCORE 8-9 (Excellent): All of the above plus considered use of og:type per content type (e.g. product on PDPs, article on blog), hreflang for international sites, structured meta that reinforces the page topic.
+   SCORE 10: Reserved for exemplary implementations across every metadata surface.
+   IMPORTANT: Do NOT award high META scores just because Open Graph is comprehensive. OG tags improve social sharing appearance, they do not meaningfully improve AI visibility. The core AI signals are title, description, canonical and lang.
 5. LINKS – internal link quality, anchor text, protocol consistency, density
 6. ALT TEXT – image alt attribute quality and completeness
 7. CRAWL – server-rendered static HTML vs JS dependency
@@ -476,7 +484,7 @@ CRITICAL RULES FOR CONTENT:
 - Never use the phrase "AI Visibility Practice".
 - The executive_summary field MUST be structured with these exact pipe-delimited sections:
   OVERVIEW: 2-3 sentences on overall AI readiness. | STRENGTHS: up to 3 short bullet points of what is working (use * prefix). | GAPS: up to 3 short bullet points of the critical gaps (use * prefix). | VERDICT: 1 sentence on the single most impactful next step.
-  Example: "OVERVIEW: Healix.com is built on strong technical foundations. AI crawlers receive full server-rendered HTML on first request. | STRENGTHS: * Comprehensive Open Graph and meta tags on every page. * Server-rendered HTML with no JS dependency. * Verifiable first-hand expertise with named clinicians and clients. | GAPS: * Zero schema.org structured data across all audited pages. * Tab and disclosure widgets are invisible to AI parsers. * og:type defaults to website on product pages. | VERDICT: Shipping Organisation, Service and BreadcrumbList schema sitewide is the single biggest unlock available."
+  Example: "OVERVIEW: Healix.com is built on strong technical foundations. AI crawlers receive full server-rendered HTML on first request. | STRENGTHS: * Bespoke title and meta description on every audited page. * Server-rendered HTML with no JS dependency. * Verifiable first-hand expertise with named clinicians and clients. | GAPS: * Zero schema.org structured data across all audited pages. * Tab and disclosure widgets are invisible to AI parsers. * og:type defaults to website on product pages. | VERDICT: Shipping Organisation, Service and BreadcrumbList schema sitewide is the single biggest unlock available."
 
 Return ONLY valid JSON in exactly this structure:
 {
