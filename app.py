@@ -112,6 +112,16 @@ def extract_page_signals(url: str, html: str) -> str:
             types_in_graph = [g.get("@type","?") if isinstance(g,dict) else "?" for g in obj["@graph"]]
             return f"@graph with {len(obj['@graph'])} nodes: {', '.join(types_in_graph[:10])}"
         # Extract useful fields based on type
+        # Fields where we expand nested sub-fields so Gemini can see what is
+        # actually populated, instead of just the nested @type (which hides
+        # completeness and causes false "incomplete" flags).
+        NESTED_FIELDS_TO_EXPAND = {
+            "address":   ["streetAddress","addressLocality","addressRegion","postalCode","addressCountry"],
+            "offers":    ["price","priceCurrency","availability","url","priceValidUntil"],
+            "author":    ["name","url"],
+            "publisher": ["name","url","logo"],
+        }
+
         useful = []
         for k in ["name","headline","url","description","datePublished","dateModified",
                   "author","publisher","offers","aggregateRating","brand","sku",
@@ -121,6 +131,15 @@ def extract_page_signals(url: str, html: str) -> str:
                 if isinstance(v, (dict, list)):
                     if k == "itemListElement" and isinstance(v, list):
                         useful.append(f"{k}=[{len(v)} items]")
+                    elif isinstance(v, dict) and k in NESTED_FIELDS_TO_EXPAND:
+                        sub_fields = NESTED_FIELDS_TO_EXPAND[k]
+                        present = [sf for sf in sub_fields if v.get(sf)]
+                        missing = [sf for sf in sub_fields if not v.get(sf)]
+                        nested_type = v.get("@type", "?")
+                        detail = f"present: {', '.join(present) if present else 'none'}"
+                        if missing:
+                            detail += f" | missing: {', '.join(missing)}"
+                        useful.append(f"{k}={{{nested_type}: {detail}}}")
                     elif isinstance(v, dict):
                         useful.append(f"{k}={{{v.get('@type','?')}}}")
                     else:
@@ -633,7 +652,13 @@ The value {TODAY_DATE} at the end of the "Pages to audit" section is the current
 
 Score EACH page 1-10 across these 9 dimensions:
 1. ARIA – landmark roles, aria-labels, accessibility for AI parsers
-2. SCHEMA – schema.org JSON-LD structured data presence and quality
+2. SCHEMA – schema.org JSON-LD structured data presence and quality.
+   The schema summary shows nested objects (address, offers, author, publisher) with their sub-fields explicitly marked as "present" or "missing". Base completeness judgements ONLY on fields explicitly listed as missing. Do NOT infer a field is missing or a stub just because a nested object is shown compactly (e.g. as {PostalAddress: ...}), that compact form is a display convention, not a sign of incompleteness.
+   Reference for what counts as a complete nested object:
+     - address (PostalAddress): complete if streetAddress, addressLocality, postalCode and addressCountry are all present. addressRegion is optional in the UK and its absence alone does not make the address incomplete.
+     - offers: complete if price, priceCurrency and availability are present.
+     - author / publisher: complete if name is present at minimum; url and logo (for publisher) are enhancements, not requirements.
+   If a nested object's "missing" list is empty, treat that field as fully complete and do not describe it as a stub, placeholder or incomplete in your findings.
 3. HEADINGS – H1-H6 hierarchy, clarity, topic signal
 4. META – Score based on what AI crawlers actually use, not social sharing signals. Use these criteria:
    HIGH-WEIGHT signals (drive most of the score): unique descriptive <title>, meta description, canonical URL, lang attribute, robots directive, viewport. These are what AI crawlers use to understand and cite a page.
