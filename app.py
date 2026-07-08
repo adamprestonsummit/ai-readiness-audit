@@ -100,6 +100,44 @@ def extract_page_signals(url: str, html: str) -> str:
         schemas = [s.strip()[:500] for s in raw_schemas if s.strip()]
     out.append("SCHEMA_JSON_LD: " + ("; ".join(schemas) if schemas else "NONE FOUND"))
 
+    # ── Pre-labelled dates ────────────────────────────────────────────
+    # Extract every date-like value from schema markup and meta tags,
+    # then label each as PAST or FUTURE against today's real date.
+    # This means Gemini never has to decide "is 2026 in the future?".
+    import re as _re
+    from datetime import date as _date
+    today = _date.today()
+    date_findings = []
+    # Combine all schema JSON-LD content + full raw HTML for date scanning
+    scan_text = " ".join(schemas) + " " + html
+    # ISO-style dates like 2026-06-02 or 2026-06-02T12:34:56
+    iso_pattern = _re.compile(r'\b(20\d{2})-(\d{2})-(\d{2})(?:T\d{2}:\d{2}[\d:.+\-Z]*)?\b')
+    seen = set()
+    for m in iso_pattern.finditer(scan_text):
+        raw_date = m.group(0)
+        if raw_date in seen:
+            continue
+        seen.add(raw_date)
+        try:
+            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            found = _date(y, mo, d)
+            label = "PAST" if found <= today else "FUTURE"
+            # Find nearby context (60 chars before) to help identify what field this is
+            start = max(0, m.start() - 60)
+            context = scan_text[start:m.start()].strip()[-40:]
+            date_findings.append(f"{raw_date} [{label}] ...{context}")
+        except ValueError:
+            continue
+        if len(date_findings) >= 15:
+            break
+
+    if date_findings:
+        out.append(
+            f"DATES_FOUND (today is {today.isoformat()}):\n" + "\n".join(date_findings)
+        )
+    else:
+        out.append(f"DATES_FOUND (today is {today.isoformat()}): NONE FOUND")
+
     # ── Heading structure ─────────────────────────────────────────────
     # Collect headings by level so H1s are never crowded out by nav H2/H3s.
     # Also include an H1 count so Gemini can spot multiple-H1 problems.
@@ -464,6 +502,9 @@ def fetch_pages(domain: str, extra_urls: list[str],
 AUDIT_PROMPT = """
 You are an expert AI visibility auditor. Audit the provided HTML pages exactly like a senior technical SEO and AI readiness consultant would.
 
+DATE CONTEXT (READ FIRST):
+The value {TODAY_DATE} at the end of the "Pages to audit" section is the current real-world date the audit is being run. Trust this value absolutely. Compare every date you see in schema markup, meta tags, article publish dates or last-modified dates against this reference date to decide whether it is past or future. Do NOT rely on your own knowledge of what year "should" be current. If a date is on or before {TODAY_DATE} it is in the past. If it is after {TODAY_DATE} it is in the future.
+
 Score EACH page 1-10 across these 9 dimensions:
 1. ARIA – landmark roles, aria-labels, accessibility for AI parsers
 2. SCHEMA – schema.org JSON-LD structured data presence and quality
@@ -616,13 +657,23 @@ def repair_and_parse(raw: str) -> dict:
 
 
 def run_audit(model, pages: dict) -> dict:
+    from datetime import date as _date
+    today_iso = _date.today().isoformat()
+    today_readable = _date.today().strftime("%d %B %Y")
+
     # pages values are already compact signal summaries from extract_page_signals
     pages_text = ""
     for url, signals in pages.items():
         pages_text += f"\n\n{'='*60}\n{signals}\n"
 
+    # Inject the current date so Gemini has ground truth for past/future checks.
+    # Gemini's training cutoff means it cannot reliably reason about dates in 2025+.
+    pages_text += f"\n\n{'='*60}\nTODAY_DATE: {today_iso} ({today_readable})\n"
+
+    prompt = AUDIT_PROMPT.replace("{TODAY_DATE}", today_iso)
+
     response = model.generate_content(
-        AUDIT_PROMPT + "\n\nPages to audit:\n" + pages_text,
+        prompt + "\n\nPages to audit:\n" + pages_text,
         generation_config={
             "temperature": 0.1,
             "max_output_tokens": 65536,   # 2.5-flash supports up to 65k output tokens
