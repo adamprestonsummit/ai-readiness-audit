@@ -94,10 +94,9 @@ def extract_page_signals(url: str, html: str) -> str:
 
     def _schema_summary(obj, depth=0):
         """Return a short human summary of a schema.org object."""
-        if depth > 3:
+        if depth > 4:
             return "..."
         if isinstance(obj, list):
-            # ItemList / array — summarise count and first item's type
             if not obj:
                 return "empty list"
             first_type = "?"
@@ -107,60 +106,113 @@ def extract_page_signals(url: str, html: str) -> str:
         if not isinstance(obj, dict):
             return type(obj).__name__
         typ = obj.get("@type", "?")
+
         # Handle @graph — array of nested schemas
         if "@graph" in obj and isinstance(obj["@graph"], list):
             types_in_graph = [g.get("@type","?") if isinstance(g,dict) else "?" for g in obj["@graph"]]
             return f"@graph with {len(obj['@graph'])} nodes: {', '.join(types_in_graph[:10])}"
-        # Extract useful fields based on type
-        # Fields where we expand nested sub-fields so Gemini can see what is
-        # actually populated, instead of just the nested @type (which hides
-        # completeness and causes false "incomplete" flags).
-        # Fields where we expand nested sub-fields so Gemini can see what is
+
+        # Nested fields whose sub-fields we expand so Gemini can see what is
         # actually populated. Only REQUIRED sub-fields are ever reported as
-        # "missing" — optional ones are simply omitted when absent, so the
-        # word "missing" only appears for genuine gaps, not for fields most
-        # sites never populate (e.g. priceValidUntil, author url, publisher logo).
+        # "missing" — optional ones are simply omitted when absent.
         NESTED_FIELDS_REQUIRED = {
-            "address":   ["streetAddress","addressLocality","postalCode","addressCountry"],
-            "offers":    ["price","priceCurrency","availability"],
-            "author":    ["name"],
-            "publisher": ["name"],
+            "address":         ["streetAddress","addressLocality","postalCode","addressCountry"],
+            "offers":          ["price","priceCurrency","availability"],
+            "author":          ["name"],
+            "publisher":       ["name"],
+            "brand":           ["name"],
+            "aggregateRating": ["ratingValue","reviewCount"],
         }
         NESTED_FIELDS_OPTIONAL = {
-            "address":   ["addressRegion"],
-            "offers":    ["url","priceValidUntil"],
-            "author":    ["url"],
-            "publisher": ["url","logo"],
+            "address":         ["addressRegion"],
+            "offers":          ["url","priceValidUntil","sku","gtin13","itemCondition"],
+            "author":          ["url"],
+            "publisher":       ["url","logo"],
+            "brand":           ["url","logo"],
+            "aggregateRating": ["bestRating","worstRating"],
         }
+        # AggregateOffer is a superset with its own required fields
+        AGG_OFFER_REQUIRED = ["lowPrice","highPrice","priceCurrency","offerCount"]
+        AGG_OFFER_OPTIONAL = ["availability","offers"]
+
+        def _describe_nested(k, v):
+            """Return a string summary of a single nested object v under key k."""
+            nested_type = v.get("@type", "?") if isinstance(v, dict) else "?"
+
+            # AggregateOffer has different required fields than Offer
+            if k == "offers" and nested_type == "AggregateOffer":
+                required = AGG_OFFER_REQUIRED
+                optional = AGG_OFFER_OPTIONAL
+            else:
+                required = NESTED_FIELDS_REQUIRED.get(k, [])
+                optional = NESTED_FIELDS_OPTIONAL.get(k, [])
+
+            present_req = [sf for sf in required if v.get(sf) is not None]
+            missing_req = [sf for sf in required if v.get(sf) is None]
+            present_opt = [sf for sf in optional if v.get(sf) is not None]
+
+            all_present = present_req + present_opt
+            # Include KEY values inline (price/rating are highly meaningful)
+            value_bits = []
+            for f in ["ratingValue","reviewCount","lowPrice","highPrice","offerCount","price","priceCurrency"]:
+                if f in v and not isinstance(v[f], (dict, list)):
+                    value_bits.append(f"{f}={v[f]}")
+            detail = f"present: {', '.join(all_present) if all_present else 'none'}"
+            if value_bits:
+                detail += f" | values: {', '.join(value_bits)}"
+            if missing_req:
+                detail += f" | missing required: {', '.join(missing_req)}"
+            return f"{{{nested_type}: {detail}}}"
 
         useful = []
         for k in ["name","headline","url","description","datePublished","dateModified",
-                  "author","publisher","offers","aggregateRating","brand","sku",
-                  "image","logo","email","telephone","address","itemListElement"]:
-            if k in obj:
-                v = obj[k]
-                if isinstance(v, (dict, list)):
-                    if k == "itemListElement" and isinstance(v, list):
-                        useful.append(f"{k}=[{len(v)} items]")
-                    elif isinstance(v, dict) and k in NESTED_FIELDS_REQUIRED:
-                        required = NESTED_FIELDS_REQUIRED[k]
-                        optional = NESTED_FIELDS_OPTIONAL.get(k, [])
-                        present_req = [sf for sf in required if v.get(sf)]
-                        missing_req = [sf for sf in required if not v.get(sf)]
-                        present_opt = [sf for sf in optional if v.get(sf)]
-                        nested_type = v.get("@type", "?")
-                        all_present = present_req + present_opt
-                        detail = f"present: {', '.join(all_present) if all_present else 'none'}"
-                        if missing_req:
-                            detail += f" | missing required: {', '.join(missing_req)}"
-                        useful.append(f"{k}={{{nested_type}: {detail}}}")
-                    elif isinstance(v, dict):
-                        useful.append(f"{k}={{{v.get('@type','?')}}}")
+                  "author","publisher","offers","aggregateRating","brand","sku","mpn","gtin13",
+                  "image","logo","email","telephone","address","itemListElement","review"]:
+            if k not in obj:
+                continue
+            v = obj[k]
+
+            # SCALAR VALUE
+            if not isinstance(v, (dict, list)):
+                val = str(v)[:80]
+                useful.append(f"{k}='{val}'")
+                continue
+
+            # LIST — the case that was previously missing for `offers`.
+            # On PDPs with variants, offers is often a list of Offer dicts.
+            if isinstance(v, list):
+                if k == "itemListElement":
+                    useful.append(f"{k}=[{len(v)} items]")
+                elif k == "offers":
+                    # Summarise the list: count and a compact view of the first offer
+                    n = len(v)
+                    if n == 0:
+                        useful.append(f"{k}=[empty list]")
                     else:
-                        useful.append(f"{k}=[{len(v)}]")
+                        first = v[0] if isinstance(v[0], dict) else None
+                        first_type = first.get("@type","?") if first else "?"
+                        first_desc = _describe_nested("offers", first) if first else "?"
+                        useful.append(f"offers=list of {n} {first_type}(s), first={first_desc}")
+                elif k == "review":
+                    useful.append(f"{k}=[{len(v)} reviews]")
+                elif k == "image":
+                    useful.append(f"{k}=[{len(v)} images]")
                 else:
-                    val = str(v)[:60]
-                    useful.append(f"{k}='{val}'")
+                    # Generic list summary — count and first type if dict
+                    if v and isinstance(v[0], dict):
+                        useful.append(f"{k}=[{len(v)} items, first @type={v[0].get('@type','?')}]")
+                    else:
+                        useful.append(f"{k}=[{len(v)} items]")
+                continue
+
+            # DICT
+            if isinstance(v, dict):
+                if k in NESTED_FIELDS_REQUIRED:
+                    useful.append(f"{k}={_describe_nested(k, v)}")
+                else:
+                    # Just report the nested @type
+                    useful.append(f"{k}={{{v.get('@type','?')}}}")
+
         return f"@type={typ}" + ((" " + ", ".join(useful)) if useful else "")
 
     def _parse_json_loose(txt):
