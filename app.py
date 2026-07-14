@@ -85,6 +85,84 @@ def extract_page_signals(url: str, html: str) -> str:
             link_tags.append(f"<link rel={rel} href={l.get('href','')[:80]}>")
     out.append("META:\n" + "\n".join(meta_items[:20] + link_tags[:5]))
 
+    # ── Microdata (itemprop / itemtype) ───────────────────────────────
+    # Some sites use Microdata (itemprop/itemscope/itemtype attributes) instead
+    # of JSON-LD. This is a valid schema.org format that AI crawlers consume.
+    # Extract each top-level itemscope block and summarise the same way as JSON-LD.
+    def _microdata_from(scope_el, depth=0):
+        """Extract microdata from an itemscope element as a dict."""
+        if depth > 4:
+            return {}
+        result = {}
+        itemtype = scope_el.get("itemtype", "")
+        # Convert schema.org URL to just the type name (like @type in JSON-LD)
+        if itemtype:
+            type_name = itemtype.rstrip("/").split("/")[-1]
+            result["@type"] = type_name
+        # Walk children looking for itemprop attributes but stop at nested itemscopes
+        # (those are handled as nested @type objects)
+        seen_props = {}
+        for el in scope_el.find_all(attrs={"itemprop": True}):
+            prop = el.get("itemprop", "").strip()
+            if not prop:
+                continue
+            # Check if this element is inside a nested itemscope (not the outer one)
+            ancestor_scope = el.find_parent(attrs={"itemscope": True})
+            if ancestor_scope is not scope_el:
+                continue  # Belongs to a nested scope, will be handled by recursion
+            # If this element itself is an itemscope, recurse
+            if el.get("itemscope") is not None or el.has_attr("itemscope"):
+                value = _microdata_from(el, depth + 1)
+            else:
+                # Extract value based on tag type
+                if el.name == "meta":
+                    value = el.get("content", "")
+                elif el.name in ("img", "audio", "video", "source"):
+                    value = el.get("src", "")
+                elif el.name in ("a", "area", "link"):
+                    value = el.get("href", "")
+                elif el.name == "object":
+                    value = el.get("data", "")
+                elif el.name == "data":
+                    value = el.get("value", "")
+                elif el.name == "time":
+                    value = el.get("datetime", "") or el.get_text(strip=True)
+                else:
+                    value = el.get_text(" ", strip=True)[:200]
+            # Handle repeated props by converting to list
+            if prop in seen_props:
+                if not isinstance(result.get(prop), list):
+                    result[prop] = [result[prop]]
+                result[prop].append(value)
+            else:
+                seen_props[prop] = True
+                result[prop] = value
+        return result
+
+    microdata_items = []
+    # Find top-level itemscope elements (those without an itemscope ancestor
+    # that has itemprop pointing to them — i.e. not nested inside another scope)
+    all_scopes = soup.find_all(attrs={"itemscope": True})
+    top_level_scopes = []
+    for scope in all_scopes:
+        # A scope is top-level if it isn't inside another itemscope with an itemprop
+        parent_scope = scope.parent
+        is_nested = False
+        while parent_scope and hasattr(parent_scope, "get"):
+            if parent_scope.get("itemscope") is not None or (hasattr(parent_scope, "has_attr") and parent_scope.has_attr("itemscope")):
+                # It's inside another scope. Check if this element is linked as a prop.
+                if scope.get("itemprop"):
+                    is_nested = True
+                break
+            parent_scope = parent_scope.parent if hasattr(parent_scope, "parent") else None
+        if not is_nested and scope.get("itemtype"):
+            top_level_scopes.append(scope)
+
+    for scope in top_level_scopes[:15]:
+        data = _microdata_from(scope)
+        if data.get("@type"):
+            microdata_items.append(data)
+
     # ── Schema / JSON-LD ──────────────────────────────────────────────
     # Instead of sending truncated raw JSON (which makes Gemini incorrectly
     # flag pages as having "truncated schema"), we summarise each schema
@@ -229,16 +307,47 @@ def extract_page_signals(url: str, html: str) -> str:
                 return None
 
     schemas = []
-    schema_scripts = list(soup.find_all("script", attrs={"type": "application/ld+json"}))
-    # Fallback: raw HTML regex if BeautifulSoup missed any
-    raw_blocks = []
-    if not schema_scripts:
-        raw_blocks = _re.findall(
-            r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-            html, _re.DOTALL | _re.IGNORECASE
-        )
 
-    schema_sources = [(s.string or s.get_text()) for s in schema_scripts] or raw_blocks
+    # Multiple detection strategies — combine ALL of them and dedupe.
+    # Case-insensitive match on the `type` attribute is critical because
+    # some sites serve `application/LD+JSON` or other casings.
+    all_raw_blocks = []
+
+    # Strategy 1: BeautifulSoup with case-insensitive type check
+    for s in soup.find_all("script"):
+        t = (s.get("type") or "").strip().lower()
+        if t == "application/ld+json":
+            raw = s.string or s.get_text()
+            if raw and raw.strip():
+                all_raw_blocks.append(raw)
+
+    # Strategy 2: raw HTML regex (case-insensitive) — ALWAYS run, not just
+    # as fallback. Catches blocks BeautifulSoup missed (e.g. inside CDATA,
+    # broken markup, or injected via inline strings).
+    regex_blocks = _re.findall(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html, _re.DOTALL | _re.IGNORECASE
+    )
+    for rb in regex_blocks:
+        rb = rb.strip()
+        if rb and rb not in all_raw_blocks:
+            all_raw_blocks.append(rb)
+
+    # Strategy 3: some CMSs (Salesforce Commerce Cloud, SAP Hybris) embed
+    # schema inside data-* attributes or invisible divs like:
+    #   <div data-schema="...json..."></div>
+    # or inside `window.dataLayer` / initial-state JSON. Look for a few
+    # common patterns and try to parse anything that starts with {"@context.
+    context_pattern = _re.findall(
+        r'\{[^{}]*?"@context"\s*:\s*"https?://schema\.org"[\s\S]*?\}(?=\s*[,;<\]\)]|$)',
+        html
+    )
+    for cb in context_pattern[:20]:  # cap to avoid runaway matches
+        cb = cb.strip()
+        if cb and cb not in all_raw_blocks and len(cb) < 20000:
+            all_raw_blocks.append(cb)
+
+    schema_sources = all_raw_blocks
     total_blocks = len(schema_sources)
 
     for i, raw_txt in enumerate(schema_sources):
@@ -256,13 +365,83 @@ def extract_page_signals(url: str, html: str) -> str:
                 summary = _schema_summary(parsed)
                 schemas.append(f"BLOCK {i+1}: {summary}")
 
-    if schemas:
-        out.append(
-            f"SCHEMA_JSON_LD ({total_blocks} block(s) found, all summarised — NOT truncated):\n"
-            + "\n".join(schemas)
-        )
+    # Combine JSON-LD schemas and microdata items into one output list
+    all_schema_summaries = list(schemas)  # from JSON-LD parsing above
+    for i, md in enumerate(microdata_items):
+        md_summary = _schema_summary(md)
+        all_schema_summaries.append(f"MICRODATA {i+1}: {md_summary}")
+
+    if all_schema_summaries:
+        jsonld_count = len(schemas)
+        md_count = len(microdata_items)
+        header_parts = []
+        if jsonld_count:
+            header_parts.append(f"{jsonld_count} JSON-LD block(s)")
+        if md_count:
+            header_parts.append(f"{md_count} Microdata item(s)")
+        header = " and ".join(header_parts) + " found, all summarised — NOT truncated"
+        out.append(f"SCHEMA_JSON_LD ({header}):\n" + "\n".join(all_schema_summaries))
     else:
-        out.append("SCHEMA_JSON_LD: NONE FOUND")
+        # Diagnostic: distinguish three scenarios:
+        # (a) genuinely no schema — no schema.org reference at all
+        # (b) JS-injected schema — has JS frameworks but schema.org only appears
+        #     in tracking/analytics code (like New Relic's "nr@context:" strings)
+        # (c) fetch got a stub / bot block — tiny HTML size
+        script_count_total = len(soup.find_all("script"))
+        html_lower = html.lower()
+        # Only count schema.org references OUTSIDE of common false-positive contexts
+        # (New Relic uses "nr@context:", some trackers reference schema.org in JS)
+        schema_org_ref = "schema.org" in html_lower
+        # Real JSON-LD would show as: {"@context":"...schema.org..."} or similar
+        # Look for a JSON-shaped schema.org reference specifically
+        json_schema_pattern = _re.search(
+            r'["\']@context["\']\s*:\s*["\'](https?:)?//schema\.org',
+            html, _re.IGNORECASE
+        )
+        # Also detect JS frameworks that commonly inject schema client-side
+        is_js_heavy = script_count_total > 10 and len(soup.get_text(strip=True)) < 500
+        js_framework_signals = any(sig in html_lower for sig in [
+            "__next_data__","window.__nuxt__","window.__initial_state__",
+            "react-dom","angular","vue.runtime","webpack","hydrate"
+        ])
+
+        diag_bits = [
+            f"html_bytes={len(html)}",
+            f"total_script_tags={script_count_total}",
+            f"schema_org_ref_in_html={'yes' if schema_org_ref else 'no'}",
+            f"json_ld_shape_detected={'yes' if json_schema_pattern else 'no'}",
+            f"js_framework_detected={'yes' if js_framework_signals else 'no'}",
+        ]
+
+        if json_schema_pattern:
+            # Real schema reference found but couldn't parse it — genuine problem
+            out.append(
+                "SCHEMA_JSON_LD: NONE PARSED (JSON-LD-shaped schema.org reference "
+                "found in HTML but could not be parsed — likely malformed or "
+                "wrapped in an unusual container). Diagnostic: "
+                + ", ".join(diag_bits)
+            )
+        elif js_framework_signals and script_count_total > 20:
+            # JS-heavy site with no server-rendered schema
+            out.append(
+                "SCHEMA_JSON_LD: NONE FOUND IN SERVER HTML (page is JS-framework "
+                "based with many script tags but no server-rendered JSON-LD). If "
+                "the site injects schema via JavaScript after page load, it will "
+                "not be visible to AI crawlers that do not execute JS. This is a "
+                "REAL AI visibility gap for the site, not a fetch limitation. "
+                "Diagnostic: " + ", ".join(diag_bits)
+            )
+        elif schema_org_ref and not json_schema_pattern:
+            # schema.org string appears but only in tracking/analytics code
+            out.append(
+                "SCHEMA_JSON_LD: NONE FOUND (the string 'schema.org' appears in "
+                "the HTML but only inside JavaScript/tracking code, not as real "
+                "structured data). Diagnostic: " + ", ".join(diag_bits)
+            )
+        else:
+            out.append(
+                "SCHEMA_JSON_LD: NONE FOUND. Diagnostic: " + ", ".join(diag_bits)
+            )
 
     # ── Pre-labelled dates ────────────────────────────────────────────
     # Extract every date-like value from schema markup and meta tags,
@@ -718,9 +897,15 @@ The value {TODAY_DATE} at the end of the "Pages to audit" section is the current
 
 Score EACH page 1-10 across these 9 dimensions:
 1. ARIA – landmark roles, aria-labels, accessibility for AI parsers
-2. SCHEMA – schema.org JSON-LD structured data presence and quality.
+2. SCHEMA – schema.org structured data presence and quality (JSON-LD OR Microdata — both are valid schema.org formats). If the SCHEMA_JSON_LD section shows either "JSON-LD block(s)" or "Microdata item(s)" or both, the site has structured data — do not report it as missing. Microdata (itemprop/itemtype) is functionally equivalent to JSON-LD for AI crawlers; do not downgrade sites for using Microdata instead of JSON-LD.
    The schema summary shows nested objects (address, offers, author, publisher) with a "present" list and, only when relevant, a "missing required" list. Optional sub-fields (e.g. addressRegion, priceValidUntil, author/publisher url, publisher logo) are never listed as missing, they are simply included in "present" when populated and left out entirely when absent. This means a nested object with no "missing required" entry is fully complete, do not describe it as a stub, placeholder or incomplete. Base every completeness judgement strictly on the "missing required" list, and treat anything not flagged there as complete.
    Each SCHEMA_JSON_LD block is a compressed summary, not truncated raw JSON, the header explicitly says so. Do NOT report schema as "truncated" based on the summary format itself.
+   Interpret the diagnostic line carefully:
+   - "SCHEMA_JSON_LD: NONE FOUND IN SERVER HTML (page is JS-framework based...)" means the site injects schema via JavaScript AFTER page load. This is a REAL AI visibility problem because most AI crawlers do not execute JavaScript. Score SCHEMA 1-3 and report clearly: "Schema is injected client-side via JavaScript. AI crawlers that do not execute JS (which is most) will not see it, even though it appears correctly in browser-based validators like Google's Rich Results Test." This is an actionable finding.
+   - "SCHEMA_JSON_LD: NONE PARSED (JSON-LD-shaped schema.org reference found in HTML but could not be parsed...)" means real schema exists but is malformed. Score 2-4 and note the malformation as a bug.
+   - "SCHEMA_JSON_LD: NONE FOUND (the string 'schema.org' appears... only inside JavaScript/tracking code)" means the site has no schema at all. The schema.org string only appears in analytics libraries like New Relic. Score SCHEMA 1-2 and report as a genuine complete absence.
+   - "SCHEMA_JSON_LD: NONE FOUND" (no further caveat) means the site has no schema at all. Score 1-2.
+   Never claim schema is "truncated" — the extractor summarises but does not truncate.
 3. HEADINGS – H1-H6 hierarchy, clarity, topic signal
 4. META – Score based on what AI crawlers actually use, not social sharing signals. Use these criteria:
    HIGH-WEIGHT signals (drive most of the score): unique descriptive <title>, meta description, canonical URL, lang attribute, robots directive, viewport. These are what AI crawlers use to understand and cite a page.
