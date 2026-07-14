@@ -49,7 +49,122 @@ def get_gemini_client():
     return genai.GenerativeModel("gemini-2.5-flash")
 
 # ─── Fetch URL HTML ───────────────────────────────────────────────────────────
-def extract_page_signals(url: str, html: str) -> str:
+# ─── robots.txt cache & disallow-rule matching ───────────────────────────────
+_ROBOTS_CACHE = {}   # {domain: {"user_agents": {ua: [disallow_patterns]}, "raw": "..."}}
+
+def _parse_robots(raw: str) -> dict:
+    """
+    Parse a robots.txt into {user_agent: [disallow_patterns]}.
+    Handles multiple user-agent blocks, wildcards, and $ end-anchors.
+    """
+    ua_rules = {}
+    current_uas = []
+    for raw_line in raw.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line or ":" not in line:
+            continue
+        field, _, value = line.partition(":")
+        field = field.strip().lower()
+        value = value.strip()
+        if field == "user-agent":
+            # New UA block. If the previous rule was Allow/Disallow, reset.
+            if current_uas and current_uas[-1] == "__transitioning__":
+                current_uas = [value.lower()]
+            else:
+                current_uas.append(value.lower())
+            ua_rules.setdefault(value.lower(), [])
+        elif field == "disallow":
+            if not current_uas:
+                current_uas = ["*"]
+            for ua in current_uas:
+                ua_rules.setdefault(ua, []).append(("disallow", value))
+        elif field == "allow":
+            if not current_uas:
+                current_uas = ["*"]
+            for ua in current_uas:
+                ua_rules.setdefault(ua, []).append(("allow", value))
+        else:
+            # Other fields (Sitemap, Crawl-delay etc.) — mark transitioning
+            current_uas = [] if field == "sitemap" else current_uas
+    return ua_rules
+
+
+def _fetch_robots_txt(session, domain_url: str) -> dict:
+    """Fetch robots.txt for a domain and return parsed rules. Cached per domain."""
+    from urllib.parse import urlparse
+    parsed = urlparse(domain_url)
+    domain_key = f"{parsed.scheme}://{parsed.netloc}"
+    if domain_key in _ROBOTS_CACHE:
+        return _ROBOTS_CACHE[domain_key]
+    result = {"user_agents": {}, "raw": "", "fetched": False, "error": None}
+    try:
+        r = session.get(f"{domain_key}/robots.txt", timeout=10, allow_redirects=True)
+        if r.status_code == 200 and len(r.text) < 200_000:
+            result["raw"] = r.text
+            result["user_agents"] = _parse_robots(r.text)
+            result["fetched"] = True
+    except Exception as e:
+        result["error"] = str(e)
+    _ROBOTS_CACHE[domain_key] = result
+    return result
+
+
+def _url_matches_disallow(url_path: str, pattern: str) -> bool:
+    """
+    Check if a URL path matches a robots.txt Disallow pattern.
+    Supports * wildcards and $ end-anchors as per RFC.
+    """
+    if not pattern:
+        return False   # empty Disallow means allow-all
+    import re as _re
+    # Convert glob-style pattern to regex
+    # Escape regex chars except * and $ (which have robots.txt meaning)
+    regex_parts = []
+    i = 0
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "*":
+            regex_parts.append(".*")
+        elif c == "$" and i == len(pattern) - 1:
+            regex_parts.append("$")
+        else:
+            regex_parts.append(_re.escape(c))
+        i += 1
+    regex = "^" + "".join(regex_parts)
+    return _re.match(regex, url_path) is not None
+
+
+def _check_links_against_robots(links: list, robots: dict, target_uas: list) -> dict:
+    """
+    Given a list of URL paths and parsed robots rules, count how many are
+    disallowed for each user-agent in target_uas.
+    Returns {"total": N, "disallowed_by_ua": {ua: [{"url": ..., "pattern": ...}]}}
+    """
+    from urllib.parse import urlparse
+    result = {"total": len(links), "disallowed_by_ua": {}}
+    ua_rules_map = robots.get("user_agents", {})
+    # Fall back to "*" if a specific UA is not listed
+    def _rules_for(ua):
+        return ua_rules_map.get(ua.lower()) or ua_rules_map.get("*") or []
+
+    for ua in target_uas:
+        rules = _rules_for(ua)
+        disallowed = []
+        for link in links:
+            parsed = urlparse(link)
+            path_with_query = parsed.path + (("?" + parsed.query) if parsed.query else "")
+            # Walk rules in order — last matching wins (longer pattern more specific)
+            matched_disallow = None
+            for rule_type, pattern in rules:
+                if _url_matches_disallow(path_with_query, pattern):
+                    matched_disallow = pattern if rule_type == "disallow" else None
+            if matched_disallow is not None:
+                disallowed.append({"url": link, "pattern": matched_disallow})
+        result["disallowed_by_ua"][ua] = disallowed
+    return result
+
+
+def extract_page_signals(url: str, html: str, robots: dict | None = None) -> str:
     """
     Compress a raw HTML page into a compact signal summary for Gemini.
     Instead of sending thousands of tokens of raw HTML, we extract exactly
@@ -529,6 +644,79 @@ def extract_page_signals(url: str, html: str) -> str:
         link_sample.append(f"{txt} -> {href[:80]}")
     out.append(f"LINKS (total found: {len(all_links)}):\n" + "\n".join(link_sample[:25]))
 
+    # ── Crawl-path check: how many internal links are disallowed by robots.txt? ──
+    # This catches "crawl-path amputation" where robots.txt blocks the URL
+    # patterns the site's own navigation uses (e.g. tracking parameters).
+    # Result: crawlers can reach the homepage but not follow nav links.
+    if robots and robots.get("fetched"):
+        from urllib.parse import urlparse, urljoin
+        current_parsed = urlparse(url)
+        current_domain = current_parsed.netloc.lower()
+        internal_links = []
+        for a in all_links:
+            href = a.get("href","").strip()
+            if not href or href.startswith(("#","mailto:","tel:","javascript:")):
+                continue
+            # Resolve relative URLs to absolute
+            absolute = urljoin(url, href)
+            parsed = urlparse(absolute)
+            # Only consider same-domain (and subdomain-matching) links as "internal"
+            link_domain = parsed.netloc.lower()
+            if link_domain == current_domain or link_domain.endswith("." + current_domain):
+                internal_links.append(absolute)
+        # Dedupe
+        internal_links = list(dict.fromkeys(internal_links))
+
+        if internal_links:
+            # Check against the most important AI crawlers plus wildcard
+            target_uas = ["*", "gptbot", "claudebot", "perplexitybot",
+                          "oai-searchbot", "googlebot", "google-extended"]
+            check = _check_links_against_robots(internal_links, robots, target_uas)
+            n_total = check["total"]
+
+            # Focus on the "*" result — the most representative of "any crawler"
+            star_disallowed = check["disallowed_by_ua"].get("*", [])
+            pct = round(100 * len(star_disallowed) / n_total) if n_total else 0
+
+            crawl_lines = [
+                f"CRAWL_PATH_CHECK ({n_total} internal links analysed):",
+                f"  Disallowed by robots.txt (User-agent: *): {len(star_disallowed)}/{n_total} ({pct}%)",
+            ]
+
+            # If a significant proportion are blocked, this is a major finding
+            if pct >= 20 and star_disallowed:
+                # Show the disallow patterns that are catching the most links
+                from collections import Counter
+                pattern_counts = Counter(d["pattern"] for d in star_disallowed)
+                crawl_lines.append(f"  Top blocking patterns:")
+                for pat, cnt in pattern_counts.most_common(5):
+                    crawl_lines.append(f"    - '{pat}' blocks {cnt} link(s)")
+                # Show 3 example blocked URLs
+                crawl_lines.append(f"  Example blocked internal links:")
+                for ex in star_disallowed[:3]:
+                    crawl_lines.append(f"    - {ex['url'][:100]} (matched: {ex['pattern']})")
+                crawl_lines.append(
+                    "  DIAGNOSIS: A high proportion of the site's own internal "
+                    "navigation is disallowed by robots.txt. This is CRAWL-PATH "
+                    "AMPUTATION — the site is server-rendered and technically "
+                    "crawlable, but crawlers hitting the homepage cannot follow "
+                    "internal links to product/category pages. They must rely on "
+                    "the XML sitemap instead, which degrades link graph signals "
+                    "(anchor text, PageRank flow, freshness discovery). AI "
+                    "crawlers that lean on live crawling rather than pre-built "
+                    "indexes are hit especially hard. Score CRAWL 3-5 despite "
+                    "server-rendering, and flag as the leading recommendation."
+                )
+            elif pct >= 5:
+                crawl_lines.append(
+                    f"  DIAGNOSIS: {pct}% of internal links are disallowed. Minor "
+                    "issue, review disallow patterns to check for accidental "
+                    "over-blocking. Score CRAWL 6-7."
+                )
+            else:
+                crawl_lines.append("  DIAGNOSIS: Internal linking is cleanly crawlable.")
+            out.append("\n".join(crawl_lines))
+
     # ── Images / alt text ─────────────────────────────────────────────
     imgs = soup.find_all("img")
     img_sample = []
@@ -744,7 +932,7 @@ def _fetch_wayback(url: str, session: requests.Session) -> tuple:
     return r.text, r.status_code, f"Wayback Machine ({closest.get('timestamp','')})"
 
 
-def fetch_single_page(url: str, session: requests.Session) -> tuple:
+def fetch_single_page(url: str, session: requests.Session, robots: dict | None = None) -> tuple:
     """
     Multi-strategy fetcher. Returns (signals_text, fetch_note).
     Strategy: direct, then Wayback fallback. If both fail or return
@@ -796,7 +984,7 @@ def fetch_single_page(url: str, session: requests.Session) -> tuple:
 
     # Detect JS shell (still useful for legitimate React/Next/Vue sites)
     is_shell = _is_js_shell(html)
-    signals  = extract_page_signals(url, html)
+    signals  = extract_page_signals(url, html, robots=robots)
 
     if is_shell:
         soup = BeautifulSoup(html, "html.parser")
@@ -867,6 +1055,10 @@ def fetch_pages(domain: str, extra_urls: list[str],
         "Cache-Control":   "no-cache",
     })
 
+    # Fetch robots.txt once for the domain (cached). This lets each page's
+    # extractor cross-check its internal links against disallow rules.
+    robots = _fetch_robots_txt(session, base)
+
     pages = {}
     for url in urls:
         # Normalise for lookup (strip trailing slash)
@@ -879,14 +1071,67 @@ def fetch_pages(domain: str, extra_urls: list[str],
                     break
 
         if pasted_match:
-            signals = extract_page_signals(url, pasted_match)
+            signals = extract_page_signals(url, pasted_match, robots=robots)
             signals += "\n\nSOURCE_NOTE: HTML was manually provided."
             pages[url] = signals
         else:
-            signals, _label = fetch_single_page(url, session)
+            signals, _label = fetch_single_page(url, session, robots=robots)
             pages[url] = signals
 
+    # Add a domain-level robots.txt summary to the last page (or first if only one)
+    # so Gemini sees the raw rules and can factor them into scoring.
+    if pages and robots.get("fetched"):
+        robots_summary = _format_robots_summary(robots)
+        last_url = list(pages.keys())[0]
+        pages[last_url] = robots_summary + "\n\n" + pages[last_url]
+
     return pages
+
+
+def _format_robots_summary(robots: dict) -> str:
+    """Produce a compact robots.txt summary for the audit."""
+    lines = ["ROBOTS_TXT_SUMMARY:"]
+    ua_rules = robots.get("user_agents", {})
+    if not ua_rules:
+        lines.append("  (no directives found in robots.txt)")
+        return "\n".join(lines)
+    # Highlight AI crawlers specifically
+    AI_CRAWLERS = ["gptbot","claudebot","claude-web","ccbot","perplexitybot",
+                   "oai-searchbot","chatgpt-user","google-extended","googleother",
+                   "anthropic-ai","cohere-ai","bytespider","facebookbot","applebot"]
+    seen_uas = set(ua_rules.keys())
+    lines.append(f"  UA blocks present: {sorted(seen_uas)}")
+
+    # For each AI crawler explicitly named, show whether it's blocked
+    ai_findings = []
+    for ai in AI_CRAWLERS:
+        if ai in seen_uas:
+            rules = ua_rules[ai]
+            disallows = [p for t, p in rules if t == "disallow"]
+            if any(d == "/" for d in disallows):
+                ai_findings.append(f"{ai}: BLOCKED ENTIRELY (Disallow: /)")
+            elif disallows:
+                ai_findings.append(f"{ai}: partial disallow ({len(disallows)} rules)")
+            else:
+                ai_findings.append(f"{ai}: allowed")
+    if ai_findings:
+        lines.append("  AI crawler directives:")
+        for f in ai_findings:
+            lines.append(f"    - {f}")
+    else:
+        lines.append("  No AI-crawler-specific directives (falls back to *)")
+
+    # Show wildcard rules
+    star_rules = ua_rules.get("*", [])
+    if star_rules:
+        disallows = [p for t, p in star_rules if t == "disallow" and p]
+        if disallows:
+            lines.append(f"  Wildcard (*) Disallow patterns ({len(disallows)}):")
+            for p in disallows[:20]:
+                lines.append(f"    - {p}")
+            if len(disallows) > 20:
+                lines.append(f"    ... and {len(disallows)-20} more")
+    return "\n".join(lines)
 
 # ─── Gemini audit ─────────────────────────────────────────────────────────────
 AUDIT_PROMPT = """
@@ -918,7 +1163,15 @@ Score EACH page 1-10 across these 9 dimensions:
    IMPORTANT: Do NOT award high META scores just because Open Graph is comprehensive. OG tags improve social sharing appearance, they do not meaningfully improve AI visibility. The core AI signals are title, description, canonical and lang.
 5. LINKS – internal link quality, anchor text, protocol consistency, density
 6. ALT TEXT – image alt attribute quality and completeness
-7. CRAWL – server-rendered static HTML vs JS dependency
+7. CRAWL – Whether AI crawlers can (a) access the page's content and (b) traverse the site's internal navigation. Do NOT score highly just because the initial HTML is server-rendered — real crawlability requires BOTH. Use these criteria:
+   HIGH-WEIGHT signals (drive most of the score): whether the initial HTML contains readable server-rendered content; whether internal navigation links are followable (i.e. not blocked by robots.txt); whether AI-specific crawlers (GPTBot, ClaudeBot, PerplexityBot, OAI-SearchBot) are permitted in robots.txt; whether the fetch went through cleanly or hit bot protection.
+   Look at the CRAWL_PATH_CHECK block. If it shows a significant proportion of internal links are disallowed by robots.txt (e.g. because tracking parameters like ?PFM= or ?realestate= are appended to nav links and those patterns are disallowed), this is CRAWL-PATH AMPUTATION. The site is server-rendered but crawlers cannot follow its own navigation. Score 3-5 and make it a leading finding, not a minor note.
+   Look at the ROBOTS_TXT_SUMMARY block. If AI crawlers (gptbot, claudebot, perplexitybot, etc.) are explicitly disallowed, this is a fundamental AI-visibility block regardless of server-rendering. Score 2-4 and flag as critical.
+   SCORE 1-3 (Poor): AI crawlers blocked in robots.txt, OR JS-only rendering with no static content, OR crawl-path amputation preventing navigation traversal.
+   SCORE 4-5 (Moderate): Server-rendered but 20%+ of internal links blocked by robots.txt patterns, OR AI crawlers not explicitly allowed and wildcard rules restrictive.
+   SCORE 6-7 (Good): Server-rendered content, clean internal linking, robots.txt does not block AI crawlers.
+   SCORE 8-9 (Excellent): All the above plus fast response times, clean canonical implementation, no redirect chains on internal links.
+   SCORE 10: Reserved for exemplary crawlability across every signal.
 8. LLM – first-hand expertise, named entities, dates, citations, authority signals
 9. CONTENT QUALITY – Score this dimension rigorously. Most commercial pages score 3-5, not 7-9. Use these specific criteria:
    SCORE 1-3 (Poor): Content is purely a list of features, specs, or product names with no explanation of why they matter to the buyer. No benefit statements. No answers to "why should I choose this?" or "what problem does this solve?". Thin content that simply labels things (e.g. "Thermostatic shower kit. Chrome finish. 200mm head.").
