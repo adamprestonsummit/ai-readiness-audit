@@ -182,6 +182,7 @@ def extract_page_signals(url: str, html: str, robots: dict | None = None) -> str
     meta_items = []
     title = soup.find("title")
     if title: meta_items.append(f"title: {title.get_text().strip()[:120]}")
+    URL_META_FIELDS = {"og:url","og:image","canonical","twitter:image"}
     for m in soup.find_all("meta"):
         name = m.get("name","") or m.get("property","")
         val  = m.get("content","")
@@ -192,13 +193,23 @@ def extract_page_signals(url: str, html: str, robots: dict | None = None) -> str
             "og:locale","og:site_name","twitter:card","twitter:title",
             "twitter:description","viewport"
         ]:
-            meta_items.append(f"{name}: {val[:120]}")
+            # Do not truncate URL-shaped fields — truncating URLs causes
+            # Gemini to falsely flag them as broken.
+            if name.lower() in URL_META_FIELDS:
+                meta_items.append(f"{name}: {val}")
+            else:
+                meta_items.append(f"{name}: {val[:120]}")
     link_tags = []
     for l in soup.find_all("link", rel=True):
         rel = " ".join(l.get("rel",[]))
         if rel in ["canonical","alternate"]:
-            link_tags.append(f"<link rel={rel} href={l.get('href','')[:80]}>")
-    out.append("META:\n" + "\n".join(meta_items[:20] + link_tags[:5]))
+            # DO NOT truncate canonical/alternate hrefs, they are full URLs
+            # and truncating them causes Gemini to falsely flag them as broken.
+            href = l.get('href','')
+            hreflang = l.get('hreflang','')
+            attr = f' hreflang={hreflang}' if hreflang else ''
+            link_tags.append(f"<link rel={rel}{attr} href={href}>")
+    out.append("META:\n" + "\n".join(meta_items[:20] + link_tags[:10]))
 
     # ── Microdata (itemprop / itemtype) ───────────────────────────────
     # Some sites use Microdata (itemprop/itemscope/itemtype attributes) instead
@@ -1153,6 +1164,8 @@ Score EACH page 1-10 across these 9 dimensions:
    Never claim schema is "truncated" — the extractor summarises but does not truncate.
 3. HEADINGS – H1-H6 hierarchy, clarity, topic signal
 4. META – Score based on what AI crawlers actually use, not social sharing signals. Use these criteria:
+   IMPORTANT: All URL values in the META block are shown in full. If a URL appears to end abruptly, that is what the extractor found in the raw HTML — but before flagging a "truncated canonical URL" as a site error, sanity-check the URL length. Canonical URLs on real sites are commonly 60-120+ characters (product pages, deep category pages, blog posts with long slugs). A canonical URL of 80+ characters ending with a slash, hyphen, or path segment is almost always genuine, not truncated. Only flag a canonical as "truncated" if it visibly ends mid-word without a natural URL terminator (no slash, no extension, no query separator).
+
    HIGH-WEIGHT signals (drive most of the score): unique descriptive <title>, meta description, canonical URL, lang attribute, robots directive, viewport. These are what AI crawlers use to understand and cite a page.
    LOW-WEIGHT signals (should contribute at most 1-2 points): Open Graph tags (og:title, og:description, og:image, og:type), Twitter Card tags. These are for social media previews, not AI citation. A page with only OG tags but no proper title or description should score 3-4, not 7-8.
    SCORE 1-3 (Poor): Missing title, no meta description, no canonical, or duplicate meta across many pages.
