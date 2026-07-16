@@ -180,25 +180,55 @@ def extract_page_signals(url: str, html: str, robots: dict | None = None) -> str
 
     # ── Meta & Open Graph ──────────────────────────────────────────────
     meta_items = []
+    def _clip(text: str, limit: int) -> str:
+        """
+        Clip text and clearly mark that the extractor did it, not the site.
+        Gemini has been coached (in the prompt) to treat "[EXTRACTOR_CLIPPED]"
+        as our tool's truncation, not a genuine site issue.
+        """
+        s = str(text).strip()
+        if len(s) <= limit:
+            return s
+        return s[:limit].rstrip() + f" [EXTRACTOR_CLIPPED at {limit} chars, original was {len(s)} chars]"
+
     title = soup.find("title")
-    if title: meta_items.append(f"title: {title.get_text().strip()[:120]}")
+    if title:
+        # Titles are generally short (10-70 chars) but some sites go longer.
+        # 200 char cap is well above any legitimate title length.
+        meta_items.append(f"title: {_clip(title.get_text(), 200)}")
+
     URL_META_FIELDS = {"og:url","og:image","canonical","twitter:image"}
+    # Long-text fields need a generous cap that comfortably fits real content:
+    # - description: Google indexes ~155-320 chars
+    # - og:description: recommended ~200 chars but often longer
+    # - twitter:description: max 200 chars per Twitter spec
+    # 400 char cap ensures we never chop legitimate content on these fields.
+    LONG_TEXT_META = {"description","og:description","twitter:description","og:title","twitter:title"}
+
     for m in soup.find_all("meta"):
         name = m.get("name","") or m.get("property","")
         val  = m.get("content","")
-        if name and val and name.lower() in [
+        if not (name and val):
+            continue
+        n_lower = name.lower()
+        if n_lower not in [
             "description","robots","author","article:author",
             "article:published_time","article:modified_time",
             "og:title","og:type","og:description","og:url","og:image",
             "og:locale","og:site_name","twitter:card","twitter:title",
             "twitter:description","viewport"
         ]:
-            # Do not truncate URL-shaped fields — truncating URLs causes
-            # Gemini to falsely flag them as broken.
-            if name.lower() in URL_META_FIELDS:
-                meta_items.append(f"{name}: {val}")
-            else:
-                meta_items.append(f"{name}: {val[:120]}")
+            continue
+
+        if n_lower in URL_META_FIELDS:
+            # URL fields: no truncation ever
+            meta_items.append(f"{name}: {val}")
+        elif n_lower in LONG_TEXT_META:
+            # Long text: 400 char cap, marked explicitly if hit
+            meta_items.append(f"{name}: {_clip(val, 400)}")
+        else:
+            # Short fields (robots, viewport, og:type, og:locale, dates): 200 char cap
+            meta_items.append(f"{name}: {_clip(val, 200)}")
     link_tags = []
     for l in soup.find_all("link", rel=True):
         rel = " ".join(l.get("rel",[]))
@@ -1164,7 +1194,10 @@ Score EACH page 1-10 across these 9 dimensions:
    Never claim schema is "truncated" — the extractor summarises but does not truncate.
 3. HEADINGS – H1-H6 hierarchy, clarity, topic signal
 4. META – Score based on what AI crawlers actually use, not social sharing signals. Use these criteria:
-   IMPORTANT: All URL values in the META block are shown in full. If a URL appears to end abruptly, that is what the extractor found in the raw HTML — but before flagging a "truncated canonical URL" as a site error, sanity-check the URL length. Canonical URLs on real sites are commonly 60-120+ characters (product pages, deep category pages, blog posts with long slugs). A canonical URL of 80+ characters ending with a slash, hyphen, or path segment is almost always genuine, not truncated. Only flag a canonical as "truncated" if it visibly ends mid-word without a natural URL terminator (no slash, no extension, no query separator).
+   IMPORTANT — TRUNCATION HANDLING:
+   Any meta value that contains the marker "[EXTRACTOR_CLIPPED at N chars, original was M chars]" was CLIPPED BY THE AUDIT TOOL for token budget reasons, NOT by the site. The full value exists on the page in its complete form. Never report a value as "truncated" or "cut off" if the marker is present — the site's implementation is fine, only the extract shown here is shortened. The marker also tells you the true length of the value on the page (M chars) so you can still judge if it is unusually long or short in absolute terms.
+   Values without the "[EXTRACTOR_CLIPPED]" marker are shown in full. If such a value appears to end abruptly, sanity-check first — meta descriptions ending at natural sentence breaks or at exactly 155/160 chars are commonly deliberate (matching Google SERP display limits) and are NOT truncation. Only flag as a genuine site error if the value ends visibly mid-word, mid-sentence, mid-tag, or with no natural terminator.
+   The same rule applies to canonical URLs: they are shown in full, real canonicals are commonly 60-120+ characters (product pages, deep categories, blog posts with long slugs). Only flag as truncated if it visibly ends mid-word without a natural URL terminator (no slash, no extension, no query separator).
 
    HIGH-WEIGHT signals (drive most of the score): unique descriptive <title>, meta description, canonical URL, lang attribute, robots directive, viewport. These are what AI crawlers use to understand and cite a page.
    LOW-WEIGHT signals (should contribute at most 1-2 points): Open Graph tags (og:title, og:description, og:image, og:type), Twitter Card tags. These are for social media previews, not AI citation. A page with only OG tags but no proper title or description should score 3-4, not 7-8.
