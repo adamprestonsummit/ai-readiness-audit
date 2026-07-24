@@ -49,122 +49,7 @@ def get_gemini_client():
     return genai.GenerativeModel("gemini-2.5-flash")
 
 # ─── Fetch URL HTML ───────────────────────────────────────────────────────────
-# ─── robots.txt cache & disallow-rule matching ───────────────────────────────
-_ROBOTS_CACHE = {}   # {domain: {"user_agents": {ua: [disallow_patterns]}, "raw": "..."}}
-
-def _parse_robots(raw: str) -> dict:
-    """
-    Parse a robots.txt into {user_agent: [disallow_patterns]}.
-    Handles multiple user-agent blocks, wildcards, and $ end-anchors.
-    """
-    ua_rules = {}
-    current_uas = []
-    for raw_line in raw.splitlines():
-        line = raw_line.split("#", 1)[0].strip()
-        if not line or ":" not in line:
-            continue
-        field, _, value = line.partition(":")
-        field = field.strip().lower()
-        value = value.strip()
-        if field == "user-agent":
-            # New UA block. If the previous rule was Allow/Disallow, reset.
-            if current_uas and current_uas[-1] == "__transitioning__":
-                current_uas = [value.lower()]
-            else:
-                current_uas.append(value.lower())
-            ua_rules.setdefault(value.lower(), [])
-        elif field == "disallow":
-            if not current_uas:
-                current_uas = ["*"]
-            for ua in current_uas:
-                ua_rules.setdefault(ua, []).append(("disallow", value))
-        elif field == "allow":
-            if not current_uas:
-                current_uas = ["*"]
-            for ua in current_uas:
-                ua_rules.setdefault(ua, []).append(("allow", value))
-        else:
-            # Other fields (Sitemap, Crawl-delay etc.) — mark transitioning
-            current_uas = [] if field == "sitemap" else current_uas
-    return ua_rules
-
-
-def _fetch_robots_txt(session, domain_url: str) -> dict:
-    """Fetch robots.txt for a domain and return parsed rules. Cached per domain."""
-    from urllib.parse import urlparse
-    parsed = urlparse(domain_url)
-    domain_key = f"{parsed.scheme}://{parsed.netloc}"
-    if domain_key in _ROBOTS_CACHE:
-        return _ROBOTS_CACHE[domain_key]
-    result = {"user_agents": {}, "raw": "", "fetched": False, "error": None}
-    try:
-        r = session.get(f"{domain_key}/robots.txt", timeout=10, allow_redirects=True)
-        if r.status_code == 200 and len(r.text) < 200_000:
-            result["raw"] = r.text
-            result["user_agents"] = _parse_robots(r.text)
-            result["fetched"] = True
-    except Exception as e:
-        result["error"] = str(e)
-    _ROBOTS_CACHE[domain_key] = result
-    return result
-
-
-def _url_matches_disallow(url_path: str, pattern: str) -> bool:
-    """
-    Check if a URL path matches a robots.txt Disallow pattern.
-    Supports * wildcards and $ end-anchors as per RFC.
-    """
-    if not pattern:
-        return False   # empty Disallow means allow-all
-    import re as _re
-    # Convert glob-style pattern to regex
-    # Escape regex chars except * and $ (which have robots.txt meaning)
-    regex_parts = []
-    i = 0
-    while i < len(pattern):
-        c = pattern[i]
-        if c == "*":
-            regex_parts.append(".*")
-        elif c == "$" and i == len(pattern) - 1:
-            regex_parts.append("$")
-        else:
-            regex_parts.append(_re.escape(c))
-        i += 1
-    regex = "^" + "".join(regex_parts)
-    return _re.match(regex, url_path) is not None
-
-
-def _check_links_against_robots(links: list, robots: dict, target_uas: list) -> dict:
-    """
-    Given a list of URL paths and parsed robots rules, count how many are
-    disallowed for each user-agent in target_uas.
-    Returns {"total": N, "disallowed_by_ua": {ua: [{"url": ..., "pattern": ...}]}}
-    """
-    from urllib.parse import urlparse
-    result = {"total": len(links), "disallowed_by_ua": {}}
-    ua_rules_map = robots.get("user_agents", {})
-    # Fall back to "*" if a specific UA is not listed
-    def _rules_for(ua):
-        return ua_rules_map.get(ua.lower()) or ua_rules_map.get("*") or []
-
-    for ua in target_uas:
-        rules = _rules_for(ua)
-        disallowed = []
-        for link in links:
-            parsed = urlparse(link)
-            path_with_query = parsed.path + (("?" + parsed.query) if parsed.query else "")
-            # Walk rules in order — last matching wins (longer pattern more specific)
-            matched_disallow = None
-            for rule_type, pattern in rules:
-                if _url_matches_disallow(path_with_query, pattern):
-                    matched_disallow = pattern if rule_type == "disallow" else None
-            if matched_disallow is not None:
-                disallowed.append({"url": link, "pattern": matched_disallow})
-        result["disallowed_by_ua"][ua] = disallowed
-    return result
-
-
-def extract_page_signals(url: str, html: str, robots: dict | None = None) -> str:
+def extract_page_signals(url: str, html: str) -> str:
     """
     Compress a raw HTML page into a compact signal summary for Gemini.
     Instead of sending thousands of tokens of raw HTML, we extract exactly
@@ -180,144 +65,25 @@ def extract_page_signals(url: str, html: str, robots: dict | None = None) -> str
 
     # ── Meta & Open Graph ──────────────────────────────────────────────
     meta_items = []
-    def _clip(text: str, limit: int) -> str:
-        """
-        Clip text and clearly mark that the extractor did it, not the site.
-        Gemini has been coached (in the prompt) to treat "[EXTRACTOR_CLIPPED]"
-        as our tool's truncation, not a genuine site issue.
-        """
-        s = str(text).strip()
-        if len(s) <= limit:
-            return s
-        return s[:limit].rstrip() + f" [EXTRACTOR_CLIPPED at {limit} chars, original was {len(s)} chars]"
-
     title = soup.find("title")
-    if title:
-        # Titles are generally short (10-70 chars) but some sites go longer.
-        # 200 char cap is well above any legitimate title length.
-        meta_items.append(f"title: {_clip(title.get_text(), 200)}")
-
-    URL_META_FIELDS = {"og:url","og:image","canonical","twitter:image"}
-    # Long-text fields need a generous cap that comfortably fits real content:
-    # - description: Google indexes ~155-320 chars
-    # - og:description: recommended ~200 chars but often longer
-    # - twitter:description: max 200 chars per Twitter spec
-    # 400 char cap ensures we never chop legitimate content on these fields.
-    LONG_TEXT_META = {"description","og:description","twitter:description","og:title","twitter:title"}
-
+    if title: meta_items.append(f"title: {title.get_text().strip()[:120]}")
     for m in soup.find_all("meta"):
         name = m.get("name","") or m.get("property","")
         val  = m.get("content","")
-        if not (name and val):
-            continue
-        n_lower = name.lower()
-        if n_lower not in [
+        if name and val and name.lower() in [
             "description","robots","author","article:author",
             "article:published_time","article:modified_time",
             "og:title","og:type","og:description","og:url","og:image",
             "og:locale","og:site_name","twitter:card","twitter:title",
             "twitter:description","viewport"
         ]:
-            continue
-
-        if n_lower in URL_META_FIELDS:
-            # URL fields: no truncation ever
-            meta_items.append(f"{name}: {val}")
-        elif n_lower in LONG_TEXT_META:
-            # Long text: 400 char cap, marked explicitly if hit
-            meta_items.append(f"{name}: {_clip(val, 400)}")
-        else:
-            # Short fields (robots, viewport, og:type, og:locale, dates): 200 char cap
-            meta_items.append(f"{name}: {_clip(val, 200)}")
+            meta_items.append(f"{name}: {val[:120]}")
     link_tags = []
     for l in soup.find_all("link", rel=True):
         rel = " ".join(l.get("rel",[]))
         if rel in ["canonical","alternate"]:
-            # DO NOT truncate canonical/alternate hrefs, they are full URLs
-            # and truncating them causes Gemini to falsely flag them as broken.
-            href = l.get('href','')
-            hreflang = l.get('hreflang','')
-            attr = f' hreflang={hreflang}' if hreflang else ''
-            link_tags.append(f"<link rel={rel}{attr} href={href}>")
-    out.append("META:\n" + "\n".join(meta_items[:20] + link_tags[:10]))
-
-    # ── Microdata (itemprop / itemtype) ───────────────────────────────
-    # Some sites use Microdata (itemprop/itemscope/itemtype attributes) instead
-    # of JSON-LD. This is a valid schema.org format that AI crawlers consume.
-    # Extract each top-level itemscope block and summarise the same way as JSON-LD.
-    def _microdata_from(scope_el, depth=0):
-        """Extract microdata from an itemscope element as a dict."""
-        if depth > 4:
-            return {}
-        result = {}
-        itemtype = scope_el.get("itemtype", "")
-        # Convert schema.org URL to just the type name (like @type in JSON-LD)
-        if itemtype:
-            type_name = itemtype.rstrip("/").split("/")[-1]
-            result["@type"] = type_name
-        # Walk children looking for itemprop attributes but stop at nested itemscopes
-        # (those are handled as nested @type objects)
-        seen_props = {}
-        for el in scope_el.find_all(attrs={"itemprop": True}):
-            prop = el.get("itemprop", "").strip()
-            if not prop:
-                continue
-            # Check if this element is inside a nested itemscope (not the outer one)
-            ancestor_scope = el.find_parent(attrs={"itemscope": True})
-            if ancestor_scope is not scope_el:
-                continue  # Belongs to a nested scope, will be handled by recursion
-            # If this element itself is an itemscope, recurse
-            if el.get("itemscope") is not None or el.has_attr("itemscope"):
-                value = _microdata_from(el, depth + 1)
-            else:
-                # Extract value based on tag type
-                if el.name == "meta":
-                    value = el.get("content", "")
-                elif el.name in ("img", "audio", "video", "source"):
-                    value = el.get("src", "")
-                elif el.name in ("a", "area", "link"):
-                    value = el.get("href", "")
-                elif el.name == "object":
-                    value = el.get("data", "")
-                elif el.name == "data":
-                    value = el.get("value", "")
-                elif el.name == "time":
-                    value = el.get("datetime", "") or el.get_text(strip=True)
-                else:
-                    value = el.get_text(" ", strip=True)[:200]
-            # Handle repeated props by converting to list
-            if prop in seen_props:
-                if not isinstance(result.get(prop), list):
-                    result[prop] = [result[prop]]
-                result[prop].append(value)
-            else:
-                seen_props[prop] = True
-                result[prop] = value
-        return result
-
-    microdata_items = []
-    # Find top-level itemscope elements (those without an itemscope ancestor
-    # that has itemprop pointing to them — i.e. not nested inside another scope)
-    all_scopes = soup.find_all(attrs={"itemscope": True})
-    top_level_scopes = []
-    for scope in all_scopes:
-        # A scope is top-level if it isn't inside another itemscope with an itemprop
-        parent_scope = scope.parent
-        is_nested = False
-        while parent_scope and hasattr(parent_scope, "get"):
-            if parent_scope.get("itemscope") is not None or (hasattr(parent_scope, "has_attr") and parent_scope.has_attr("itemscope")):
-                # It's inside another scope. Check if this element is linked as a prop.
-                if scope.get("itemprop"):
-                    is_nested = True
-                break
-            parent_scope = parent_scope.parent if hasattr(parent_scope, "parent") else None
-        if not is_nested and scope.get("itemtype"):
-            top_level_scopes.append(scope)
-
-    for scope in top_level_scopes[:15]:
-        data = _microdata_from(scope)
-        if data.get("@type"):
-            microdata_items.append(data)
+            link_tags.append(f"<link rel={rel} href={l.get('href','')[:80]}>")
+    out.append("META:\n" + "\n".join(meta_items[:20] + link_tags[:5]))
 
     # ── Schema / JSON-LD ──────────────────────────────────────────────
     # Instead of sending truncated raw JSON (which makes Gemini incorrectly
@@ -328,9 +94,10 @@ def extract_page_signals(url: str, html: str, robots: dict | None = None) -> str
 
     def _schema_summary(obj, depth=0):
         """Return a short human summary of a schema.org object."""
-        if depth > 4:
+        if depth > 3:
             return "..."
         if isinstance(obj, list):
+            # ItemList / array — summarise count and first item's type
             if not obj:
                 return "empty list"
             first_type = "?"
@@ -340,113 +107,60 @@ def extract_page_signals(url: str, html: str, robots: dict | None = None) -> str
         if not isinstance(obj, dict):
             return type(obj).__name__
         typ = obj.get("@type", "?")
-
         # Handle @graph — array of nested schemas
         if "@graph" in obj and isinstance(obj["@graph"], list):
             types_in_graph = [g.get("@type","?") if isinstance(g,dict) else "?" for g in obj["@graph"]]
             return f"@graph with {len(obj['@graph'])} nodes: {', '.join(types_in_graph[:10])}"
-
-        # Nested fields whose sub-fields we expand so Gemini can see what is
+        # Extract useful fields based on type
+        # Fields where we expand nested sub-fields so Gemini can see what is
+        # actually populated, instead of just the nested @type (which hides
+        # completeness and causes false "incomplete" flags).
+        # Fields where we expand nested sub-fields so Gemini can see what is
         # actually populated. Only REQUIRED sub-fields are ever reported as
-        # "missing" — optional ones are simply omitted when absent.
+        # "missing" — optional ones are simply omitted when absent, so the
+        # word "missing" only appears for genuine gaps, not for fields most
+        # sites never populate (e.g. priceValidUntil, author url, publisher logo).
         NESTED_FIELDS_REQUIRED = {
-            "address":         ["streetAddress","addressLocality","postalCode","addressCountry"],
-            "offers":          ["price","priceCurrency","availability"],
-            "author":          ["name"],
-            "publisher":       ["name"],
-            "brand":           ["name"],
-            "aggregateRating": ["ratingValue","reviewCount"],
+            "address":   ["streetAddress","addressLocality","postalCode","addressCountry"],
+            "offers":    ["price","priceCurrency","availability"],
+            "author":    ["name"],
+            "publisher": ["name"],
         }
         NESTED_FIELDS_OPTIONAL = {
-            "address":         ["addressRegion"],
-            "offers":          ["url","priceValidUntil","sku","gtin13","itemCondition"],
-            "author":          ["url"],
-            "publisher":       ["url","logo"],
-            "brand":           ["url","logo"],
-            "aggregateRating": ["bestRating","worstRating"],
+            "address":   ["addressRegion"],
+            "offers":    ["url","priceValidUntil"],
+            "author":    ["url"],
+            "publisher": ["url","logo"],
         }
-        # AggregateOffer is a superset with its own required fields
-        AGG_OFFER_REQUIRED = ["lowPrice","highPrice","priceCurrency","offerCount"]
-        AGG_OFFER_OPTIONAL = ["availability","offers"]
-
-        def _describe_nested(k, v):
-            """Return a string summary of a single nested object v under key k."""
-            nested_type = v.get("@type", "?") if isinstance(v, dict) else "?"
-
-            # AggregateOffer has different required fields than Offer
-            if k == "offers" and nested_type == "AggregateOffer":
-                required = AGG_OFFER_REQUIRED
-                optional = AGG_OFFER_OPTIONAL
-            else:
-                required = NESTED_FIELDS_REQUIRED.get(k, [])
-                optional = NESTED_FIELDS_OPTIONAL.get(k, [])
-
-            present_req = [sf for sf in required if v.get(sf) is not None]
-            missing_req = [sf for sf in required if v.get(sf) is None]
-            present_opt = [sf for sf in optional if v.get(sf) is not None]
-
-            all_present = present_req + present_opt
-            # Include KEY values inline (price/rating are highly meaningful)
-            value_bits = []
-            for f in ["ratingValue","reviewCount","lowPrice","highPrice","offerCount","price","priceCurrency"]:
-                if f in v and not isinstance(v[f], (dict, list)):
-                    value_bits.append(f"{f}={v[f]}")
-            detail = f"present: {', '.join(all_present) if all_present else 'none'}"
-            if value_bits:
-                detail += f" | values: {', '.join(value_bits)}"
-            if missing_req:
-                detail += f" | missing required: {', '.join(missing_req)}"
-            return f"{{{nested_type}: {detail}}}"
 
         useful = []
         for k in ["name","headline","url","description","datePublished","dateModified",
-                  "author","publisher","offers","aggregateRating","brand","sku","mpn","gtin13",
-                  "image","logo","email","telephone","address","itemListElement","review"]:
-            if k not in obj:
-                continue
-            v = obj[k]
-
-            # SCALAR VALUE
-            if not isinstance(v, (dict, list)):
-                val = str(v)[:80]
-                useful.append(f"{k}='{val}'")
-                continue
-
-            # LIST — the case that was previously missing for `offers`.
-            # On PDPs with variants, offers is often a list of Offer dicts.
-            if isinstance(v, list):
-                if k == "itemListElement":
-                    useful.append(f"{k}=[{len(v)} items]")
-                elif k == "offers":
-                    # Summarise the list: count and a compact view of the first offer
-                    n = len(v)
-                    if n == 0:
-                        useful.append(f"{k}=[empty list]")
-                    else:
-                        first = v[0] if isinstance(v[0], dict) else None
-                        first_type = first.get("@type","?") if first else "?"
-                        first_desc = _describe_nested("offers", first) if first else "?"
-                        useful.append(f"offers=list of {n} {first_type}(s), first={first_desc}")
-                elif k == "review":
-                    useful.append(f"{k}=[{len(v)} reviews]")
-                elif k == "image":
-                    useful.append(f"{k}=[{len(v)} images]")
-                else:
-                    # Generic list summary — count and first type if dict
-                    if v and isinstance(v[0], dict):
-                        useful.append(f"{k}=[{len(v)} items, first @type={v[0].get('@type','?')}]")
-                    else:
+                  "author","publisher","offers","aggregateRating","brand","sku",
+                  "image","logo","email","telephone","address","itemListElement"]:
+            if k in obj:
+                v = obj[k]
+                if isinstance(v, (dict, list)):
+                    if k == "itemListElement" and isinstance(v, list):
                         useful.append(f"{k}=[{len(v)} items]")
-                continue
-
-            # DICT
-            if isinstance(v, dict):
-                if k in NESTED_FIELDS_REQUIRED:
-                    useful.append(f"{k}={_describe_nested(k, v)}")
+                    elif isinstance(v, dict) and k in NESTED_FIELDS_REQUIRED:
+                        required = NESTED_FIELDS_REQUIRED[k]
+                        optional = NESTED_FIELDS_OPTIONAL.get(k, [])
+                        present_req = [sf for sf in required if v.get(sf)]
+                        missing_req = [sf for sf in required if not v.get(sf)]
+                        present_opt = [sf for sf in optional if v.get(sf)]
+                        nested_type = v.get("@type", "?")
+                        all_present = present_req + present_opt
+                        detail = f"present: {', '.join(all_present) if all_present else 'none'}"
+                        if missing_req:
+                            detail += f" | missing required: {', '.join(missing_req)}"
+                        useful.append(f"{k}={{{nested_type}: {detail}}}")
+                    elif isinstance(v, dict):
+                        useful.append(f"{k}={{{v.get('@type','?')}}}")
+                    else:
+                        useful.append(f"{k}=[{len(v)}]")
                 else:
-                    # Just report the nested @type
-                    useful.append(f"{k}={{{v.get('@type','?')}}}")
-
+                    val = str(v)[:60]
+                    useful.append(f"{k}='{val}'")
         return f"@type={typ}" + ((" " + ", ".join(useful)) if useful else "")
 
     def _parse_json_loose(txt):
@@ -463,47 +177,16 @@ def extract_page_signals(url: str, html: str, robots: dict | None = None) -> str
                 return None
 
     schemas = []
+    schema_scripts = list(soup.find_all("script", attrs={"type": "application/ld+json"}))
+    # Fallback: raw HTML regex if BeautifulSoup missed any
+    raw_blocks = []
+    if not schema_scripts:
+        raw_blocks = _re.findall(
+            r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+            html, _re.DOTALL | _re.IGNORECASE
+        )
 
-    # Multiple detection strategies — combine ALL of them and dedupe.
-    # Case-insensitive match on the `type` attribute is critical because
-    # some sites serve `application/LD+JSON` or other casings.
-    all_raw_blocks = []
-
-    # Strategy 1: BeautifulSoup with case-insensitive type check
-    for s in soup.find_all("script"):
-        t = (s.get("type") or "").strip().lower()
-        if t == "application/ld+json":
-            raw = s.string or s.get_text()
-            if raw and raw.strip():
-                all_raw_blocks.append(raw)
-
-    # Strategy 2: raw HTML regex (case-insensitive) — ALWAYS run, not just
-    # as fallback. Catches blocks BeautifulSoup missed (e.g. inside CDATA,
-    # broken markup, or injected via inline strings).
-    regex_blocks = _re.findall(
-        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-        html, _re.DOTALL | _re.IGNORECASE
-    )
-    for rb in regex_blocks:
-        rb = rb.strip()
-        if rb and rb not in all_raw_blocks:
-            all_raw_blocks.append(rb)
-
-    # Strategy 3: some CMSs (Salesforce Commerce Cloud, SAP Hybris) embed
-    # schema inside data-* attributes or invisible divs like:
-    #   <div data-schema="...json..."></div>
-    # or inside `window.dataLayer` / initial-state JSON. Look for a few
-    # common patterns and try to parse anything that starts with {"@context.
-    context_pattern = _re.findall(
-        r'\{[^{}]*?"@context"\s*:\s*"https?://schema\.org"[\s\S]*?\}(?=\s*[,;<\]\)]|$)',
-        html
-    )
-    for cb in context_pattern[:20]:  # cap to avoid runaway matches
-        cb = cb.strip()
-        if cb and cb not in all_raw_blocks and len(cb) < 20000:
-            all_raw_blocks.append(cb)
-
-    schema_sources = all_raw_blocks
+    schema_sources = [(s.string or s.get_text()) for s in schema_scripts] or raw_blocks
     total_blocks = len(schema_sources)
 
     for i, raw_txt in enumerate(schema_sources):
@@ -521,83 +204,13 @@ def extract_page_signals(url: str, html: str, robots: dict | None = None) -> str
                 summary = _schema_summary(parsed)
                 schemas.append(f"BLOCK {i+1}: {summary}")
 
-    # Combine JSON-LD schemas and microdata items into one output list
-    all_schema_summaries = list(schemas)  # from JSON-LD parsing above
-    for i, md in enumerate(microdata_items):
-        md_summary = _schema_summary(md)
-        all_schema_summaries.append(f"MICRODATA {i+1}: {md_summary}")
-
-    if all_schema_summaries:
-        jsonld_count = len(schemas)
-        md_count = len(microdata_items)
-        header_parts = []
-        if jsonld_count:
-            header_parts.append(f"{jsonld_count} JSON-LD block(s)")
-        if md_count:
-            header_parts.append(f"{md_count} Microdata item(s)")
-        header = " and ".join(header_parts) + " found, all summarised — NOT truncated"
-        out.append(f"SCHEMA_JSON_LD ({header}):\n" + "\n".join(all_schema_summaries))
-    else:
-        # Diagnostic: distinguish three scenarios:
-        # (a) genuinely no schema — no schema.org reference at all
-        # (b) JS-injected schema — has JS frameworks but schema.org only appears
-        #     in tracking/analytics code (like New Relic's "nr@context:" strings)
-        # (c) fetch got a stub / bot block — tiny HTML size
-        script_count_total = len(soup.find_all("script"))
-        html_lower = html.lower()
-        # Only count schema.org references OUTSIDE of common false-positive contexts
-        # (New Relic uses "nr@context:", some trackers reference schema.org in JS)
-        schema_org_ref = "schema.org" in html_lower
-        # Real JSON-LD would show as: {"@context":"...schema.org..."} or similar
-        # Look for a JSON-shaped schema.org reference specifically
-        json_schema_pattern = _re.search(
-            r'["\']@context["\']\s*:\s*["\'](https?:)?//schema\.org',
-            html, _re.IGNORECASE
+    if schemas:
+        out.append(
+            f"SCHEMA_JSON_LD ({total_blocks} block(s) found, all summarised — NOT truncated):\n"
+            + "\n".join(schemas)
         )
-        # Also detect JS frameworks that commonly inject schema client-side
-        is_js_heavy = script_count_total > 10 and len(soup.get_text(strip=True)) < 500
-        js_framework_signals = any(sig in html_lower for sig in [
-            "__next_data__","window.__nuxt__","window.__initial_state__",
-            "react-dom","angular","vue.runtime","webpack","hydrate"
-        ])
-
-        diag_bits = [
-            f"html_bytes={len(html)}",
-            f"total_script_tags={script_count_total}",
-            f"schema_org_ref_in_html={'yes' if schema_org_ref else 'no'}",
-            f"json_ld_shape_detected={'yes' if json_schema_pattern else 'no'}",
-            f"js_framework_detected={'yes' if js_framework_signals else 'no'}",
-        ]
-
-        if json_schema_pattern:
-            # Real schema reference found but couldn't parse it — genuine problem
-            out.append(
-                "SCHEMA_JSON_LD: NONE PARSED (JSON-LD-shaped schema.org reference "
-                "found in HTML but could not be parsed — likely malformed or "
-                "wrapped in an unusual container). Diagnostic: "
-                + ", ".join(diag_bits)
-            )
-        elif js_framework_signals and script_count_total > 20:
-            # JS-heavy site with no server-rendered schema
-            out.append(
-                "SCHEMA_JSON_LD: NONE FOUND IN SERVER HTML (page is JS-framework "
-                "based with many script tags but no server-rendered JSON-LD). If "
-                "the site injects schema via JavaScript after page load, it will "
-                "not be visible to AI crawlers that do not execute JS. This is a "
-                "REAL AI visibility gap for the site, not a fetch limitation. "
-                "Diagnostic: " + ", ".join(diag_bits)
-            )
-        elif schema_org_ref and not json_schema_pattern:
-            # schema.org string appears but only in tracking/analytics code
-            out.append(
-                "SCHEMA_JSON_LD: NONE FOUND (the string 'schema.org' appears in "
-                "the HTML but only inside JavaScript/tracking code, not as real "
-                "structured data). Diagnostic: " + ", ".join(diag_bits)
-            )
-        else:
-            out.append(
-                "SCHEMA_JSON_LD: NONE FOUND. Diagnostic: " + ", ".join(diag_bits)
-            )
+    else:
+        out.append("SCHEMA_JSON_LD: NONE FOUND")
 
     # ── Pre-labelled dates ────────────────────────────────────────────
     # Extract every date-like value from schema markup and meta tags,
@@ -684,79 +297,6 @@ def extract_page_signals(url: str, html: str, robots: dict | None = None) -> str
         txt  = a.get_text(" ",strip=True)[:50]
         link_sample.append(f"{txt} -> {href[:80]}")
     out.append(f"LINKS (total found: {len(all_links)}):\n" + "\n".join(link_sample[:25]))
-
-    # ── Crawl-path check: how many internal links are disallowed by robots.txt? ──
-    # This catches "crawl-path amputation" where robots.txt blocks the URL
-    # patterns the site's own navigation uses (e.g. tracking parameters).
-    # Result: crawlers can reach the homepage but not follow nav links.
-    if robots and robots.get("fetched"):
-        from urllib.parse import urlparse, urljoin
-        current_parsed = urlparse(url)
-        current_domain = current_parsed.netloc.lower()
-        internal_links = []
-        for a in all_links:
-            href = a.get("href","").strip()
-            if not href or href.startswith(("#","mailto:","tel:","javascript:")):
-                continue
-            # Resolve relative URLs to absolute
-            absolute = urljoin(url, href)
-            parsed = urlparse(absolute)
-            # Only consider same-domain (and subdomain-matching) links as "internal"
-            link_domain = parsed.netloc.lower()
-            if link_domain == current_domain or link_domain.endswith("." + current_domain):
-                internal_links.append(absolute)
-        # Dedupe
-        internal_links = list(dict.fromkeys(internal_links))
-
-        if internal_links:
-            # Check against the most important AI crawlers plus wildcard
-            target_uas = ["*", "gptbot", "claudebot", "perplexitybot",
-                          "oai-searchbot", "googlebot", "google-extended"]
-            check = _check_links_against_robots(internal_links, robots, target_uas)
-            n_total = check["total"]
-
-            # Focus on the "*" result — the most representative of "any crawler"
-            star_disallowed = check["disallowed_by_ua"].get("*", [])
-            pct = round(100 * len(star_disallowed) / n_total) if n_total else 0
-
-            crawl_lines = [
-                f"CRAWL_PATH_CHECK ({n_total} internal links analysed):",
-                f"  Disallowed by robots.txt (User-agent: *): {len(star_disallowed)}/{n_total} ({pct}%)",
-            ]
-
-            # If a significant proportion are blocked, this is a major finding
-            if pct >= 20 and star_disallowed:
-                # Show the disallow patterns that are catching the most links
-                from collections import Counter
-                pattern_counts = Counter(d["pattern"] for d in star_disallowed)
-                crawl_lines.append(f"  Top blocking patterns:")
-                for pat, cnt in pattern_counts.most_common(5):
-                    crawl_lines.append(f"    - '{pat}' blocks {cnt} link(s)")
-                # Show 3 example blocked URLs
-                crawl_lines.append(f"  Example blocked internal links:")
-                for ex in star_disallowed[:3]:
-                    crawl_lines.append(f"    - {ex['url'][:100]} (matched: {ex['pattern']})")
-                crawl_lines.append(
-                    "  DIAGNOSIS: A high proportion of the site's own internal "
-                    "navigation is disallowed by robots.txt. This is CRAWL-PATH "
-                    "AMPUTATION — the site is server-rendered and technically "
-                    "crawlable, but crawlers hitting the homepage cannot follow "
-                    "internal links to product/category pages. They must rely on "
-                    "the XML sitemap instead, which degrades link graph signals "
-                    "(anchor text, PageRank flow, freshness discovery). AI "
-                    "crawlers that lean on live crawling rather than pre-built "
-                    "indexes are hit especially hard. Score CRAWL 3-5 despite "
-                    "server-rendering, and flag as the leading recommendation."
-                )
-            elif pct >= 5:
-                crawl_lines.append(
-                    f"  DIAGNOSIS: {pct}% of internal links are disallowed. Minor "
-                    "issue, review disallow patterns to check for accidental "
-                    "over-blocking. Score CRAWL 6-7."
-                )
-            else:
-                crawl_lines.append("  DIAGNOSIS: Internal linking is cleanly crawlable.")
-            out.append("\n".join(crawl_lines))
 
     # ── Images / alt text ─────────────────────────────────────────────
     imgs = soup.find_all("img")
@@ -973,7 +513,7 @@ def _fetch_wayback(url: str, session: requests.Session) -> tuple:
     return r.text, r.status_code, f"Wayback Machine ({closest.get('timestamp','')})"
 
 
-def fetch_single_page(url: str, session: requests.Session, robots: dict | None = None) -> tuple:
+def fetch_single_page(url: str, session: requests.Session) -> tuple:
     """
     Multi-strategy fetcher. Returns (signals_text, fetch_note).
     Strategy: direct, then Wayback fallback. If both fail or return
@@ -1025,7 +565,7 @@ def fetch_single_page(url: str, session: requests.Session, robots: dict | None =
 
     # Detect JS shell (still useful for legitimate React/Next/Vue sites)
     is_shell = _is_js_shell(html)
-    signals  = extract_page_signals(url, html, robots=robots)
+    signals  = extract_page_signals(url, html)
 
     if is_shell:
         soup = BeautifulSoup(html, "html.parser")
@@ -1044,39 +584,74 @@ def fetch_single_page(url: str, session: requests.Session, robots: dict | None =
     return signals, label
 
 
+def _normalise_url(u: str) -> str:
+    """
+    Normalise a URL for comparison/deduping.
+    Handles: scheme (http/https), www prefix, trailing slash, casing of host.
+    Preserves path casing (paths ARE case-sensitive).
+    """
+    if not u:
+        return ""
+    u = u.strip()
+    # Ensure scheme
+    if not u.startswith(("http://", "https://")):
+        u = "https://" + u
+    from urllib.parse import urlparse, urlunparse
+    try:
+        p = urlparse(u)
+        host = p.netloc.lower()
+        # Strip www. for comparison purposes
+        if host.startswith("www."):
+            host = host[4:]
+        # Force https scheme for comparison
+        path = p.path.rstrip("/") or "/"
+        return f"https://{host}{path}"
+    except Exception:
+        return u.rstrip("/").lower()
+
+
 def fetch_pages(domain: str, extra_urls: list[str],
                 pasted_html: dict | None = None) -> dict[str, str]:
     """
     Fetch up to 4 pages. pasted_html is an optional {url: html} dict
     for manually pasted content (bypasses fetch entirely for those URLs).
 
-    URL priority order:
-    1. All pasted URLs (already have HTML, no fetch needed)
-    2. The base domain homepage
-    3. Any extra_urls typed in the text area
-    Up to 4 total, deduped, preserving order.
+    Key rules:
+    - When pasted_html has content, PASTED URLs are always preferred over
+      network fetches, even if the network could succeed.
+    - When ANY URL matches a pasted entry (after normalising scheme/www/
+      trailing-slash differences), that pasted HTML is used.
+    - Homepage is only added to the list if there's room after pasted URLs
+      and it hasn't already been provided via pasted_html.
     """
     base = domain.rstrip("/")
     if not base.startswith("http"):
         base = "https://" + base
 
-    # Build the master URL list — pasted URLs come first so they're
-    # guaranteed a slot; then homepage; then any manually typed extras.
-    seen = {}
+    # Build a fast-lookup index of pasted URLs by normalised form
+    pasted_index = {}   # normalised_url -> (original_url, html)
+    for pu, ph in (pasted_html or {}).items():
+        key = _normalise_url(pu)
+        if key:
+            pasted_index[key] = (pu, ph)
+
+    # Build the master URL list
+    seen = set()
     ordered_urls = []
 
     def add_url(u):
-        u = u.strip().rstrip("/")
-        if u and u not in seen:
-            seen[u] = True
-            ordered_urls.append(u)
+        norm = _normalise_url(u)
+        if norm and norm not in seen:
+            seen.add(norm)
+            ordered_urls.append(u.strip().rstrip("/"))
 
-    # 1. Pasted URLs (guaranteed to be processed)
-    for u in (pasted_html or {}).keys():
-        add_url(u)
+    # 1. Pasted URLs first (guaranteed slots)
+    for pu in (pasted_html or {}).keys():
+        add_url(pu)
 
-    # 2. Homepage
-    add_url(base)
+    # 2. Homepage — only if not already covered by a pasted URL
+    if _normalise_url(base) not in seen:
+        add_url(base)
 
     # 3. Extra typed URLs
     for u in extra_urls:
@@ -1096,83 +671,30 @@ def fetch_pages(domain: str, extra_urls: list[str],
         "Cache-Control":   "no-cache",
     })
 
-    # Fetch robots.txt once for the domain (cached). This lets each page's
-    # extractor cross-check its internal links against disallow rules.
-    robots = _fetch_robots_txt(session, base)
-
     pages = {}
     for url in urls:
-        # Normalise for lookup (strip trailing slash)
-        lookup = url.rstrip("/")
-        pasted_match = None
-        if pasted_html:
-            for pu, ph in pasted_html.items():
-                if pu.rstrip("/") == lookup:
-                    pasted_match = ph
-                    break
+        norm = _normalise_url(url)
+        pasted_match = pasted_index.get(norm)
 
         if pasted_match:
-            signals = extract_page_signals(url, pasted_match, robots=robots)
+            _orig_url, ph = pasted_match
+            signals = extract_page_signals(url, ph)
             signals += "\n\nSOURCE_NOTE: HTML was manually provided."
             pages[url] = signals
         else:
-            signals, _label = fetch_single_page(url, session, robots=robots)
+            signals, _label = fetch_single_page(url, session)
+            # SAFETY NET: if fetch failed/blocked AND we have any pasted HTML
+            # at all, note the mismatch so the UI can help the user.
+            if ("FETCH_BLOCKED" in signals or "FETCH_FAILED" in signals) and pasted_html:
+                signals += (
+                    f"\n\nFETCH_HINT: You pasted HTML for other URLs but this "
+                    f"URL ({url}) was not matched. Check that the URL in the "
+                    f"'Site blocked by bot protection' paste form matches "
+                    f"exactly (scheme, www, trailing slash all handled)."
+                )
             pages[url] = signals
 
-    # Add a domain-level robots.txt summary to the last page (or first if only one)
-    # so Gemini sees the raw rules and can factor them into scoring.
-    if pages and robots.get("fetched"):
-        robots_summary = _format_robots_summary(robots)
-        last_url = list(pages.keys())[0]
-        pages[last_url] = robots_summary + "\n\n" + pages[last_url]
-
     return pages
-
-
-def _format_robots_summary(robots: dict) -> str:
-    """Produce a compact robots.txt summary for the audit."""
-    lines = ["ROBOTS_TXT_SUMMARY:"]
-    ua_rules = robots.get("user_agents", {})
-    if not ua_rules:
-        lines.append("  (no directives found in robots.txt)")
-        return "\n".join(lines)
-    # Highlight AI crawlers specifically
-    AI_CRAWLERS = ["gptbot","claudebot","claude-web","ccbot","perplexitybot",
-                   "oai-searchbot","chatgpt-user","google-extended","googleother",
-                   "anthropic-ai","cohere-ai","bytespider","facebookbot","applebot"]
-    seen_uas = set(ua_rules.keys())
-    lines.append(f"  UA blocks present: {sorted(seen_uas)}")
-
-    # For each AI crawler explicitly named, show whether it's blocked
-    ai_findings = []
-    for ai in AI_CRAWLERS:
-        if ai in seen_uas:
-            rules = ua_rules[ai]
-            disallows = [p for t, p in rules if t == "disallow"]
-            if any(d == "/" for d in disallows):
-                ai_findings.append(f"{ai}: BLOCKED ENTIRELY (Disallow: /)")
-            elif disallows:
-                ai_findings.append(f"{ai}: partial disallow ({len(disallows)} rules)")
-            else:
-                ai_findings.append(f"{ai}: allowed")
-    if ai_findings:
-        lines.append("  AI crawler directives:")
-        for f in ai_findings:
-            lines.append(f"    - {f}")
-    else:
-        lines.append("  No AI-crawler-specific directives (falls back to *)")
-
-    # Show wildcard rules
-    star_rules = ua_rules.get("*", [])
-    if star_rules:
-        disallows = [p for t, p in star_rules if t == "disallow" and p]
-        if disallows:
-            lines.append(f"  Wildcard (*) Disallow patterns ({len(disallows)}):")
-            for p in disallows[:20]:
-                lines.append(f"    - {p}")
-            if len(disallows) > 20:
-                lines.append(f"    ... and {len(disallows)-20} more")
-    return "\n".join(lines)
 
 # ─── Gemini audit ─────────────────────────────────────────────────────────────
 AUDIT_PROMPT = """
@@ -1183,22 +705,11 @@ The value {TODAY_DATE} at the end of the "Pages to audit" section is the current
 
 Score EACH page 1-10 across these 9 dimensions:
 1. ARIA – landmark roles, aria-labels, accessibility for AI parsers
-2. SCHEMA – schema.org structured data presence and quality (JSON-LD OR Microdata — both are valid schema.org formats). If the SCHEMA_JSON_LD section shows either "JSON-LD block(s)" or "Microdata item(s)" or both, the site has structured data — do not report it as missing. Microdata (itemprop/itemtype) is functionally equivalent to JSON-LD for AI crawlers; do not downgrade sites for using Microdata instead of JSON-LD.
+2. SCHEMA – schema.org JSON-LD structured data presence and quality.
    The schema summary shows nested objects (address, offers, author, publisher) with a "present" list and, only when relevant, a "missing required" list. Optional sub-fields (e.g. addressRegion, priceValidUntil, author/publisher url, publisher logo) are never listed as missing, they are simply included in "present" when populated and left out entirely when absent. This means a nested object with no "missing required" entry is fully complete, do not describe it as a stub, placeholder or incomplete. Base every completeness judgement strictly on the "missing required" list, and treat anything not flagged there as complete.
    Each SCHEMA_JSON_LD block is a compressed summary, not truncated raw JSON, the header explicitly says so. Do NOT report schema as "truncated" based on the summary format itself.
-   Interpret the diagnostic line carefully:
-   - "SCHEMA_JSON_LD: NONE FOUND IN SERVER HTML (page is JS-framework based...)" means the site injects schema via JavaScript AFTER page load. This is a REAL AI visibility problem because most AI crawlers do not execute JavaScript. Score SCHEMA 1-3 and report clearly: "Schema is injected client-side via JavaScript. AI crawlers that do not execute JS (which is most) will not see it, even though it appears correctly in browser-based validators like Google's Rich Results Test." This is an actionable finding.
-   - "SCHEMA_JSON_LD: NONE PARSED (JSON-LD-shaped schema.org reference found in HTML but could not be parsed...)" means real schema exists but is malformed. Score 2-4 and note the malformation as a bug.
-   - "SCHEMA_JSON_LD: NONE FOUND (the string 'schema.org' appears... only inside JavaScript/tracking code)" means the site has no schema at all. The schema.org string only appears in analytics libraries like New Relic. Score SCHEMA 1-2 and report as a genuine complete absence.
-   - "SCHEMA_JSON_LD: NONE FOUND" (no further caveat) means the site has no schema at all. Score 1-2.
-   Never claim schema is "truncated" — the extractor summarises but does not truncate.
 3. HEADINGS – H1-H6 hierarchy, clarity, topic signal
 4. META – Score based on what AI crawlers actually use, not social sharing signals. Use these criteria:
-   IMPORTANT — TRUNCATION HANDLING:
-   Any meta value that contains the marker "[EXTRACTOR_CLIPPED at N chars, original was M chars]" was CLIPPED BY THE AUDIT TOOL for token budget reasons, NOT by the site. The full value exists on the page in its complete form. Never report a value as "truncated" or "cut off" if the marker is present — the site's implementation is fine, only the extract shown here is shortened. The marker also tells you the true length of the value on the page (M chars) so you can still judge if it is unusually long or short in absolute terms.
-   Values without the "[EXTRACTOR_CLIPPED]" marker are shown in full. If such a value appears to end abruptly, sanity-check first — meta descriptions ending at natural sentence breaks or at exactly 155/160 chars are commonly deliberate (matching Google SERP display limits) and are NOT truncation. Only flag as a genuine site error if the value ends visibly mid-word, mid-sentence, mid-tag, or with no natural terminator.
-   The same rule applies to canonical URLs: they are shown in full, real canonicals are commonly 60-120+ characters (product pages, deep categories, blog posts with long slugs). Only flag as truncated if it visibly ends mid-word without a natural URL terminator (no slash, no extension, no query separator).
-
    HIGH-WEIGHT signals (drive most of the score): unique descriptive <title>, meta description, canonical URL, lang attribute, robots directive, viewport. These are what AI crawlers use to understand and cite a page.
    LOW-WEIGHT signals (should contribute at most 1-2 points): Open Graph tags (og:title, og:description, og:image, og:type), Twitter Card tags. These are for social media previews, not AI citation. A page with only OG tags but no proper title or description should score 3-4, not 7-8.
    SCORE 1-3 (Poor): Missing title, no meta description, no canonical, or duplicate meta across many pages.
@@ -1209,15 +720,7 @@ Score EACH page 1-10 across these 9 dimensions:
    IMPORTANT: Do NOT award high META scores just because Open Graph is comprehensive. OG tags improve social sharing appearance, they do not meaningfully improve AI visibility. The core AI signals are title, description, canonical and lang.
 5. LINKS – internal link quality, anchor text, protocol consistency, density
 6. ALT TEXT – image alt attribute quality and completeness
-7. CRAWL – Whether AI crawlers can (a) access the page's content and (b) traverse the site's internal navigation. Do NOT score highly just because the initial HTML is server-rendered — real crawlability requires BOTH. Use these criteria:
-   HIGH-WEIGHT signals (drive most of the score): whether the initial HTML contains readable server-rendered content; whether internal navigation links are followable (i.e. not blocked by robots.txt); whether AI-specific crawlers (GPTBot, ClaudeBot, PerplexityBot, OAI-SearchBot) are permitted in robots.txt; whether the fetch went through cleanly or hit bot protection.
-   Look at the CRAWL_PATH_CHECK block. If it shows a significant proportion of internal links are disallowed by robots.txt (e.g. because tracking parameters like ?PFM= or ?realestate= are appended to nav links and those patterns are disallowed), this is CRAWL-PATH AMPUTATION. The site is server-rendered but crawlers cannot follow its own navigation. Score 3-5 and make it a leading finding, not a minor note.
-   Look at the ROBOTS_TXT_SUMMARY block. If AI crawlers (gptbot, claudebot, perplexitybot, etc.) are explicitly disallowed, this is a fundamental AI-visibility block regardless of server-rendering. Score 2-4 and flag as critical.
-   SCORE 1-3 (Poor): AI crawlers blocked in robots.txt, OR JS-only rendering with no static content, OR crawl-path amputation preventing navigation traversal.
-   SCORE 4-5 (Moderate): Server-rendered but 20%+ of internal links blocked by robots.txt patterns, OR AI crawlers not explicitly allowed and wildcard rules restrictive.
-   SCORE 6-7 (Good): Server-rendered content, clean internal linking, robots.txt does not block AI crawlers.
-   SCORE 8-9 (Excellent): All the above plus fast response times, clean canonical implementation, no redirect chains on internal links.
-   SCORE 10: Reserved for exemplary crawlability across every signal.
+7. CRAWL – server-rendered static HTML vs JS dependency
 8. LLM – first-hand expertise, named entities, dates, citations, authority signals
 9. CONTENT QUALITY – Score this dimension rigorously. Most commercial pages score 3-5, not 7-9. Use these specific criteria:
    SCORE 1-3 (Poor): Content is purely a list of features, specs, or product names with no explanation of why they matter to the buyer. No benefit statements. No answers to "why should I choose this?" or "what problem does this solve?". Thin content that simply labels things (e.g. "Thermostatic shower kit. Chrome finish. 200mm head.").
