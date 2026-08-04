@@ -980,6 +980,65 @@ def _gemini_safe_generate(model, prompt_text: str, generation_config: dict) -> s
     raise RuntimeError(f"Gemini returned no usable text: {reason}")
 
 
+def _normalise_audit_shape(result: dict) -> dict:
+    """
+    Gemini occasionally returns dimensions as a list of objects instead of a
+    dict keyed by dimension name, or returns an individual dimension value as
+    a list wrapping the real dict. Both shapes cause `.get()` calls
+    downstream to raise `AttributeError: 'list' object has no attribute 'get'`.
+    Coerce everything back into the expected {dim_key: {score, ...}} shape.
+    """
+    if not isinstance(result, dict):
+        return result
+    pages = result.get("pages")
+    if not isinstance(pages, list):
+        return result
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        dims = page.get("dimensions")
+        # Case 1: dimensions came back as a list of dimension objects
+        if isinstance(dims, list):
+            fixed = {}
+            for item in dims:
+                if isinstance(item, dict):
+                    key = (item.get("name") or item.get("dimension")
+                           or item.get("key") or item.get("id"))
+                    if key:
+                        fixed[str(key)] = item
+            page["dimensions"] = fixed
+            dims = fixed
+        if not isinstance(dims, dict):
+            page["dimensions"] = {}
+            continue
+        # Case 2: an individual dimension value is a list, not a dict
+        for k, v in list(dims.items()):
+            if isinstance(v, list):
+                dims[k] = v[0] if (v and isinstance(v[0], dict)) else {}
+            elif not isinstance(v, dict):
+                dims[k] = {}
+    # Also normalise dimension_averages if it drifted to a list
+    da = result.get("dimension_averages")
+    if isinstance(da, list):
+        fixed = {}
+        for item in da:
+            if isinstance(item, dict):
+                key = item.get("name") or item.get("dimension") or item.get("key")
+                val = item.get("score") or item.get("average") or item.get("value")
+                if key is not None and val is not None:
+                    fixed[str(key)] = val
+        result["dimension_averages"] = fixed
+    return result
+
+
+def _dim_dict(dims, dk):
+    """Safe accessor: always returns a dict for a dimension entry."""
+    if not isinstance(dims, dict):
+        return {}
+    v = dims.get(dk)
+    return v if isinstance(v, dict) else {}
+
+
 def run_audit(model, pages: dict) -> dict:
     from datetime import date as _date
     today_iso = _date.today().isoformat()
@@ -1022,6 +1081,9 @@ def run_audit(model, pages: dict) -> dict:
         )
         raw2 = clean_json_string(raw_text2)
         result = repair_and_parse(raw2)
+
+    # ── Normalise Gemini's occasional shape drift before any .get() chains ──
+    result = _normalise_audit_shape(result)
 
     # ── Post-process: fill missing recommendations from page findings ──────
     if not result.get("recommendations"):
@@ -1083,20 +1145,22 @@ def run_audit(model, pages: dict) -> dict:
 
     # ── Always recalculate scores from dimension data (don't trust Gemini's maths) ──
     dim_keys = ["aria", "schema", "headings", "meta", "links", "alt_text", "crawl", "llm", "content_quality"]
-    for page in result.get("pages", []):
+    for page in result.get("pages", []) or []:
+        if not isinstance(page, dict):
+            continue
         dims = page.get("dimensions", {})
-        dim_scores = [dims.get(dk, {}).get("score", 0) for dk in dim_keys]
-        if any(s > 0 for s in dim_scores):
+        dim_scores = [_dim_dict(dims, dk).get("score", 0) or 0 for dk in dim_keys]
+        if any((s or 0) > 0 for s in dim_scores):
             page["score"] = sum(dim_scores)   # sum of 8 dims = score out of 80
 
     # Recalculate dimension averages across all pages
-    pages = result.get("pages", [])
+    pages = [p for p in (result.get("pages", []) or []) if isinstance(p, dict)]
     if pages:
         for dk in dim_keys:
-            scores = [p.get("dimensions", {}).get(dk, {}).get("score", 0) for p in pages]
+            scores = [_dim_dict(p.get("dimensions", {}), dk).get("score", 0) or 0 for p in pages]
             result.setdefault("dimension_averages", {})[dk] = round(sum(scores) / len(scores), 1)
         # Recalculate average_score as average of page totals (out of 80)
-        page_totals = [p.get("score", 0) for p in pages]
+        page_totals = [p.get("score", 0) or 0 for p in pages]
         result["average_score"] = round(sum(page_totals) / len(page_totals), 1)
 
     return result
@@ -1142,12 +1206,30 @@ def build_docx(data: dict, month_year: str) -> bytes:
     enriched["dim_keys"]     = dim_keys
     enriched["dim_labels"]   = dim_labels
     # Add colour fields
+    # Defensive: dimension_averages / dimensions may occasionally arrive as
+    # lists rather than dicts if Gemini shape-drifted. _normalise_audit_shape
+    # should have handled this upstream, but re-guard here since build_docx
+    # can also be called on cached/loaded audit data.
     dim_avg = enriched.get("dimension_averages", {})
-    enriched["dim_colors"] = {k: score_color_hex(dim_avg.get(k, 0)) for k in dim_keys}
-    for page in enriched.get("pages", []):
+    if not isinstance(dim_avg, dict):
+        dim_avg = {}
+    enriched["dim_colors"] = {k: score_color_hex(dim_avg.get(k, 0) or 0) for k in dim_keys}
+    for page in enriched.get("pages", []) or []:
+        if not isinstance(page, dict):
+            continue
         dims = page.get("dimensions", {})
-        page["dim_colors"] = {k: score_color_hex(dims.get(k, {}).get("score", 0)) for k in dim_keys}
-        page["score_color"] = score_color_hex(page.get("score", 0))
+        if not isinstance(dims, dict):
+            dims = {}
+            page["dimensions"] = dims
+        def _safe_score(dk):
+            v = dims.get(dk)
+            if isinstance(v, list):
+                v = v[0] if (v and isinstance(v[0], dict)) else {}
+            if not isinstance(v, dict):
+                return 0
+            return v.get("score", 0) or 0
+        page["dim_colors"] = {k: score_color_hex(_safe_score(k)) for k in dim_keys}
+        page["score_color"] = score_color_hex(page.get("score", 0) or 0)
 
     # Ensure docx npm package is available — install locally if not found globally
     app_dir = os.path.dirname(os.path.abspath(__file__))
