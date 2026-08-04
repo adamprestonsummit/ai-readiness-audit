@@ -114,6 +114,25 @@ def extract_page_signals(url: str, html: str) -> str:
     # dozens of Product schemas — each is summarised, not truncated.
     import json as _json
 
+    def _typestr(t) -> str:
+        """
+        @type in schema.org can be a string, a list of strings, or a URL.
+        Normalise all cases to a compact display string.
+        """
+        if t is None:
+            return "?"
+        if isinstance(t, list):
+            parts = []
+            for x in t:
+                if isinstance(x, str):
+                    parts.append(x.rstrip("/").split("/")[-1] or x)
+                else:
+                    parts.append("?")
+            return "+".join(parts) if parts else "?"
+        if isinstance(t, str):
+            return t.rstrip("/").split("/")[-1] or t
+        return "?"
+
     def _schema_summary(obj, depth=0):
         """Return a short human summary of a schema.org object."""
         if depth > 3:
@@ -124,14 +143,17 @@ def extract_page_signals(url: str, html: str) -> str:
                 return "empty list"
             first_type = "?"
             if isinstance(obj[0], dict):
-                first_type = obj[0].get("@type", "?")
+                first_type = _typestr(obj[0].get("@type"))
             return f"list of {len(obj)} items (first @type={first_type})"
         if not isinstance(obj, dict):
             return type(obj).__name__
-        typ = obj.get("@type", "?")
+        typ = _typestr(obj.get("@type"))
         # Handle @graph — array of nested schemas
         if "@graph" in obj and isinstance(obj["@graph"], list):
-            types_in_graph = [g.get("@type","?") if isinstance(g,dict) else "?" for g in obj["@graph"]]
+            types_in_graph = [
+                _typestr(g.get("@type")) if isinstance(g, dict) else "?"
+                for g in obj["@graph"]
+            ]
             return f"@graph with {len(obj['@graph'])} nodes: {', '.join(types_in_graph[:10])}"
         # Extract useful fields based on type
         # Fields where we expand nested sub-fields so Gemini can see what is
@@ -170,14 +192,14 @@ def extract_page_signals(url: str, html: str) -> str:
                         present_req = [sf for sf in required if v.get(sf)]
                         missing_req = [sf for sf in required if not v.get(sf)]
                         present_opt = [sf for sf in optional if v.get(sf)]
-                        nested_type = v.get("@type", "?")
+                        nested_type = _typestr(v.get("@type"))
                         all_present = present_req + present_opt
                         detail = f"present: {', '.join(all_present) if all_present else 'none'}"
                         if missing_req:
                             detail += f" | missing required: {', '.join(missing_req)}"
                         useful.append(f"{k}={{{nested_type}: {detail}}}")
                     elif isinstance(v, dict):
-                        useful.append(f"{k}={{{v.get('@type','?')}}}")
+                        useful.append(f"{k}={{{_typestr(v.get('@type'))}}}")
                     else:
                         useful.append(f"{k}=[{len(v)}]")
                 else:
