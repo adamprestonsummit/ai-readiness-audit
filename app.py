@@ -49,6 +49,13 @@ def get_gemini_client():
     return genai.GenerativeModel("gemini-2.5-flash")
 
 # ─── Fetch URL HTML ───────────────────────────────────────────────────────────
+# Hard cap on raw HTML size before we even parse it. On extreme PLPs
+# (e.g. category pages with 100+ products fully rendered inline) some
+# sites return 5-10MB of HTML. Parsing that much can take 30+ seconds
+# with BeautifulSoup and generates far more signal than Gemini needs.
+# 3MB comfortably covers even the largest real-world pages.
+MAX_HTML_BYTES = 3_000_000
+
 def extract_page_signals(url: str, html: str) -> str:
     """
     Compress a raw HTML page into a compact signal summary for Gemini.
@@ -57,11 +64,26 @@ def extract_page_signals(url: str, html: str) -> str:
     This keeps each page under ~2000 tokens while preserving all audit signals.
     """
     import re as _re
+    original_html_len = len(html)
+    html_was_capped = False
+    if original_html_len > MAX_HTML_BYTES:
+        # Keep the head (all meta/schema is up top) plus a slice of the body
+        # so link/alt/heading extraction still works on the visible portion.
+        html = html[:MAX_HTML_BYTES]
+        html_was_capped = True
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript", "svg", "path"]):
         tag.decompose()
 
     out = [f"URL: {url}"]
+    if html_was_capped:
+        out.append(
+            f"[EXTRACTOR_HTML_CAPPED: page was {original_html_len} bytes, "
+            f"processed the first {MAX_HTML_BYTES} bytes only. The head "
+            f"(meta/schema) is fully covered but body-derived signals "
+            f"(headings, links, alt, body content) reflect only the "
+            f"beginning of the page. Do not treat this as a site issue.]"
+        )
 
     # ── Meta & Open Graph ──────────────────────────────────────────────
     meta_items = []
@@ -858,30 +880,110 @@ def repair_and_parse(raw: str) -> dict:
     raise ValueError(f"Could not parse Gemini response as JSON. First 300 chars:\n{raw[:300]}")
 
 
+# Hard cap: max characters of extracted signals we'll send per page.
+# ~40k chars per page × 4 pages ≈ 160k chars ≈ 40k tokens — well within
+# Gemini 2.5 Flash's 1M input window but keeps generation snappy and
+# stops PLPs with runaway product listings from starving other pages.
+MAX_SIGNAL_CHARS_PER_PAGE = 40_000
+
+
+def _cap_signals(signals: str, url: str) -> str:
+    """Cap signals to MAX_SIGNAL_CHARS_PER_PAGE with a clear notice."""
+    if len(signals) <= MAX_SIGNAL_CHARS_PER_PAGE:
+        return signals
+    truncated = signals[:MAX_SIGNAL_CHARS_PER_PAGE]
+    # Try to end at a section boundary for cleanliness
+    last_section = truncated.rfind("\n\n")
+    if last_section > MAX_SIGNAL_CHARS_PER_PAGE - 5000:
+        truncated = truncated[:last_section]
+    original_len = len(signals)
+    truncated += (
+        f"\n\n[EXTRACTOR_CAP: This page's signal output was truncated at "
+        f"{len(truncated)} chars (original was {original_len} chars). This is "
+        f"a tool-side cap to keep the audit tractable, NOT a site issue. "
+        f"Score dimensions based on what is present in the signals shown above; "
+        f"do not report the truncation as a problem with the site itself.]"
+    )
+    return truncated
+
+
+def _gemini_safe_generate(model, prompt_text: str, generation_config: dict) -> str:
+    """
+    Call Gemini and safely extract text.
+    Gemini can return responses with no text (safety filter, blocked, empty
+    candidates) — accessing response.text on those raises, which used to
+    kill the audit silently. This wrapper always returns a string or raises
+    with a clear reason.
+    """
+    try:
+        response = model.generate_content(
+            prompt_text, generation_config=generation_config
+        )
+    except Exception as e:
+        raise RuntimeError(f"Gemini API call failed: {type(e).__name__}: {e}")
+
+    # Extract text robustly — response.text may raise if no valid candidate
+    try:
+        text = response.text
+        if text and text.strip():
+            return text
+    except (ValueError, AttributeError):
+        pass
+
+    # Fall back: dig into candidates manually to get a useful error message
+    reason_bits = []
+    try:
+        pf = response.prompt_feedback
+        if pf and pf.block_reason:
+            reason_bits.append(f"prompt_block_reason={pf.block_reason}")
+    except Exception:
+        pass
+    try:
+        for i, c in enumerate(response.candidates or []):
+            if hasattr(c, 'finish_reason'):
+                reason_bits.append(f"candidate_{i}_finish={c.finish_reason}")
+            if hasattr(c, 'safety_ratings') and c.safety_ratings:
+                blocked = [s for s in c.safety_ratings if getattr(s, 'blocked', False)]
+                if blocked:
+                    reason_bits.append(f"candidate_{i}_safety_blocked={len(blocked)}")
+            # Try to extract partial text
+            if hasattr(c, 'content') and c.content and c.content.parts:
+                partial = "".join(getattr(p, 'text', '') for p in c.content.parts)
+                if partial.strip():
+                    return partial
+    except Exception:
+        pass
+
+    reason = ", ".join(reason_bits) if reason_bits else "unknown reason (empty response)"
+    raise RuntimeError(f"Gemini returned no usable text: {reason}")
+
+
 def run_audit(model, pages: dict) -> dict:
     from datetime import date as _date
     today_iso = _date.today().isoformat()
     today_readable = _date.today().strftime("%d %B %Y")
 
-    # pages values are already compact signal summaries from extract_page_signals
+    # Cap each page's signals to prevent runaway PLP HTML from starving
+    # other pages of budget or timing out the Gemini call.
     pages_text = ""
     for url, signals in pages.items():
-        pages_text += f"\n\n{'='*60}\n{signals}\n"
+        capped = _cap_signals(signals, url)
+        pages_text += f"\n\n{'='*60}\n{capped}\n"
 
     # Inject the current date so Gemini has ground truth for past/future checks.
-    # Gemini's training cutoff means it cannot reliably reason about dates in 2025+.
     pages_text += f"\n\n{'='*60}\nTODAY_DATE: {today_iso} ({today_readable})\n"
 
     prompt = AUDIT_PROMPT.replace("{TODAY_DATE}", today_iso)
 
-    response = model.generate_content(
+    raw_text = _gemini_safe_generate(
+        model,
         prompt + "\n\nPages to audit:\n" + pages_text,
         generation_config={
             "temperature": 0.1,
-            "max_output_tokens": 65536,   # 2.5-flash supports up to 65k output tokens
+            "max_output_tokens": 65536,
         },
     )
-    raw = clean_json_string(response.text)
+    raw = clean_json_string(raw_text)
 
     try:
         result = repair_and_parse(raw)
@@ -892,11 +994,11 @@ def run_audit(model, pages: dict) -> dict:
             "Return ONLY the corrected JSON object with no other text, "
             "no markdown fences, no explanation:\n\n" + raw[:6000]
         )
-        retry = model.generate_content(
-            fix_prompt,
-            generation_config={"temperature": 0.0, "max_output_tokens": 8192},
+        raw_text2 = _gemini_safe_generate(
+            model, fix_prompt,
+            generation_config={"temperature": 0.0, "max_output_tokens": 65536},
         )
-        raw2 = clean_json_string(retry.text)
+        raw2 = clean_json_string(raw_text2)
         result = repair_and_parse(raw2)
 
     # ── Post-process: fill missing recommendations from page findings ──────
@@ -1905,11 +2007,30 @@ if run:
         "\n".join(fetch_log)
     )
 
+    # Compute total signal size for diagnostics — helps user understand
+    # if their pages are unusually large.
+    total_signal_chars = sum(len(s) for s in pages.values())
+    largest_page = max(pages.items(), key=lambda kv: len(kv[1]))
+
     with st.spinner("Analysing with Gemini — this takes 20–40 seconds…"):
         try:
             audit = run_audit(model, pages)
         except Exception as e:
-            st.error(f"Gemini audit failed: {e}")
+            st.error(f"❌ Gemini audit failed: {type(e).__name__}: {e}")
+            # Diagnostics — help user understand WHY
+            with st.expander("🔧 Diagnostic details (click to expand)"):
+                st.markdown(f"**Total signal size sent to Gemini:** {total_signal_chars:,} characters")
+                st.markdown("**Per-page signal sizes:**")
+                for _url, _sig in pages.items():
+                    over_cap = " ⚠️ over per-page cap" if len(_sig) > 40_000 else ""
+                    st.markdown(f"- `{_url}` — {len(_sig):,} chars{over_cap}")
+                st.markdown(
+                    "**Common causes of Gemini audit failure:**\n"
+                    "- Large PLPs with runaway product listings (try pasting a smaller sample page instead)\n"
+                    "- Content that triggered Gemini's safety filters\n"
+                    "- Temporary Gemini API issue — try again in a moment\n"
+                    "- API rate limit or quota exhausted (check your Gemini console)"
+                )
             st.stop()
 
     # Pre-generate both files while we have the data
