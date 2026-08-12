@@ -22,6 +22,17 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from io import BytesIO
 from PIL import Image as PILImage
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse, urljoin
+from urllib.robotparser import RobotFileParser
+
+# python-docx for building the editable one-pager Word file
+from docx import Document
+from docx.shared import Pt, Cm, RGBColor, Mm, Inches
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_ALIGN_VERTICAL
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
 
 # ─── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -47,6 +58,268 @@ def get_gemini_client():
         st.stop()
     genai.configure(api_key=api_key)
     return genai.GenerativeModel("gemini-2.5-flash")
+
+# ─── AI bot access check ──────────────────────────────────────────────────────
+# The AI ecosystem publishes user-agents for the bots that fetch web content
+# on behalf of ChatGPT, Claude, Perplexity, Gemini and friends. Site owners
+# can (deliberately or accidentally) block these via robots.txt or WAF rules,
+# which stops their content ever appearing in AI answers. We check both.
+#
+# References:
+#   OpenAI:       https://platform.openai.com/docs/bots
+#   Anthropic:    https://support.anthropic.com/en/articles/8896518
+#   Google:       https://developers.google.com/search/docs/crawling-indexing/overview-google-crawlers
+#   Perplexity:   https://docs.perplexity.ai/guides/bots
+#   Common Crawl: https://commoncrawl.org/ccbot
+AI_BOTS = [
+    # (user_agent, vendor, purpose)
+    ("GPTBot",             "OpenAI",       "Training crawler for ChatGPT models"),
+    ("OAI-SearchBot",      "OpenAI",       "Indexes pages for ChatGPT Search"),
+    ("ChatGPT-User",       "OpenAI",       "On-demand fetch when a user asks ChatGPT about a URL"),
+    ("ClaudeBot",          "Anthropic",    "Training crawler for Claude"),
+    ("Claude-Web",         "Anthropic",    "On-demand fetch when a user asks Claude about a URL"),
+    ("anthropic-ai",       "Anthropic",    "Legacy Anthropic crawler user-agent"),
+    ("Google-Extended",    "Google",       "Opt-out control for Gemini / Vertex AI training"),
+    ("PerplexityBot",      "Perplexity",   "Indexes pages so they can be cited in Perplexity answers"),
+    ("Perplexity-User",    "Perplexity",   "On-demand fetch when a Perplexity user opens a link"),
+    ("CCBot",              "Common Crawl", "Training corpus used by many LLMs including GPT and Claude"),
+    ("Applebot-Extended",  "Apple",        "Opt-out control for Apple Intelligence training"),
+    ("Meta-ExternalAgent", "Meta",         "Training crawler for Meta AI / Llama"),
+    ("Amazonbot",          "Amazon",       "Powers Alexa and Amazon AI answers"),
+    ("Bytespider",         "ByteDance",    "Training crawler for Doubao / TikTok AI"),
+    ("MistralAI-User",     "Mistral",      "On-demand fetch for Le Chat"),
+    ("DuckAssistBot",      "DuckDuckGo",   "Indexes for DuckAssist AI answers"),
+]
+
+# UA strings paired with the fake header we send when doing live checks.
+# We send a bot-shaped UA and see whether the site returns 200 or a block.
+_LIVE_UA_TEMPLATE = "Mozilla/5.0 (compatible; {bot}/1.0; +https://example.com/bot)"
+
+# The bots that matter most for AI visibility right now — blocking any of
+# these has a direct, measurable impact on whether the site can appear in
+# ChatGPT, Claude, Perplexity or Gemini answers. Used to raise a red
+# callout at the top of every output.
+CRITICAL_AI_BOTS = {
+    "GPTBot":          ("ChatGPT",    "OpenAI's training crawler"),
+    "OAI-SearchBot":   ("ChatGPT Search", "Indexes pages for ChatGPT's search product"),
+    "ClaudeBot":       ("Claude",     "Anthropic's training + citation crawler"),
+    "PerplexityBot":   ("Perplexity", "Indexes pages so they can be cited in Perplexity answers"),
+    "Google-Extended": ("Gemini",     "Opt-out control for Gemini training"),
+}
+
+
+def get_blocked_critical_bots(bot_access: dict) -> list[dict]:
+    """
+    Return the list of CRITICAL_AI_BOTS whose overall verdict is 'blocked'.
+    Each entry is the full bot dict from bot_access['bots'] with an extra
+    'product' and 'why_it_matters' pulled from CRITICAL_AI_BOTS.
+    """
+    if not bot_access or not isinstance(bot_access, dict):
+        return []
+    bots = bot_access.get("bots") or []
+    out = []
+    for b in bots:
+        ua = b.get("user_agent", "")
+        if ua in CRITICAL_AI_BOTS and b.get("verdict") == "blocked":
+            product, why = CRITICAL_AI_BOTS[ua]
+            enriched = dict(b)
+            enriched["product"] = product
+            enriched["why_it_matters"] = why
+            out.append(enriched)
+    return out
+
+
+def _fetch_robots_txt(domain: str, session: requests.Session) -> tuple[str, str, str]:
+    """
+    Try https then http, with and without www, until we find a robots.txt.
+    Returns (fetched_url, content, error_message). One of content/error is set.
+    """
+    parsed = urlparse(domain if "://" in domain else f"https://{domain}")
+    host = parsed.netloc or parsed.path
+    host = host.strip("/")
+    candidates = []
+    for scheme in ("https", "http"):
+        for h in ({host, host.removeprefix("www."), f"www.{host.removeprefix('www.')}"}):
+            candidates.append(f"{scheme}://{h}/robots.txt")
+    seen = set()
+    last_err = ""
+    for url in candidates:
+        if url in seen:
+            continue
+        seen.add(url)
+        try:
+            r = session.get(url, timeout=8, allow_redirects=True)
+            if r.status_code == 200 and r.text.strip():
+                return url, r.text, ""
+            last_err = f"HTTP {r.status_code} at {url}"
+        except requests.RequestException as e:
+            last_err = f"{type(e).__name__} at {url}"
+    return "", "", last_err or "robots.txt not found on any host/scheme variant"
+
+
+def _robots_status_for_bot(robots_text: str, bot_ua: str) -> tuple[str, str]:
+    """
+    Determine what the robots.txt says about a specific bot user-agent.
+    Returns (status, evidence) where status is one of:
+      - "blocked_all"          Disallow: / for this UA (or a User-agent: * that matches)
+      - "blocked_partial"      Some Disallow rules but not "/"
+      - "allowed"              Explicit rules exist and none block "/"
+      - "not_specified"        No explicit rules for this UA, and * has no Disallow
+      - "no_robots"            No robots.txt found at all
+    """
+    if not robots_text:
+        return "no_robots", "No robots.txt file found on the site."
+
+    # urllib.robotparser handles the RFC properly (longest-match user-agent,
+    # rule precedence, etc). We use it for the authoritative allow/deny call
+    # on "/", then supplement with a manual scan for the "did this UA appear
+    # at all?" question, since RobotFileParser hides that from us.
+    try:
+        rp = RobotFileParser()
+        rp.parse(robots_text.splitlines())
+        can_root = rp.can_fetch(bot_ua, "/")
+    except Exception:
+        can_root = True  # be charitable if the file is malformed
+
+    # Manual scan for explicit mention & any Disallow rules
+    ua_re = re.compile(r"^\s*user-agent\s*:\s*(.+?)\s*(?:#.*)?$", re.I | re.M)
+    lines = robots_text.splitlines()
+    explicit_group = False
+    disallow_lines: list[str] = []
+    in_matching_group = False
+    for ln in lines:
+        m = ua_re.match(ln)
+        if m:
+            ua = m.group(1).strip().lower()
+            if ua == bot_ua.lower():
+                in_matching_group = True
+                explicit_group = True
+            else:
+                in_matching_group = False
+            continue
+        if in_matching_group:
+            s = ln.strip()
+            if s.lower().startswith("disallow:"):
+                val = s.split(":", 1)[1].strip()
+                if val:
+                    disallow_lines.append(val)
+
+    if not can_root:
+        # Determine whether that block came from this bot's group or from *
+        if explicit_group and any(d == "/" for d in disallow_lines):
+            return "blocked_all", "Explicitly blocked from the whole site via robots.txt: 'User-agent: %s' + 'Disallow: /'." % bot_ua
+        return "blocked_all", "Blocked from the site root by a robots.txt rule (likely a 'User-agent: *' catch-all with 'Disallow: /')."
+
+    if explicit_group:
+        if disallow_lines:
+            return "blocked_partial", "Specific paths are disallowed for %s (e.g. %s) but the site root is still crawlable." % (bot_ua, ", ".join(disallow_lines[:3]))
+        return "allowed", "%s is explicitly named in robots.txt and has no Disallow rules." % bot_ua
+
+    return "not_specified", "robots.txt does not mention %s. Default behaviour applies (site is crawlable)." % bot_ua
+
+
+def _live_check_bot(url: str, bot_ua: str, session: requests.Session) -> dict:
+    """Fetch the URL as the given bot UA and record the response."""
+    headers = {
+        "User-Agent":      _LIVE_UA_TEMPLATE.format(bot=bot_ua),
+        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-GB,en;q=0.9",
+    }
+    try:
+        r = session.get(url, headers=headers, timeout=10, allow_redirects=True)
+        code = r.status_code
+        if code == 200:
+            status = "allowed"
+        elif code in (401, 403, 429, 451):
+            status = "blocked"
+        elif 500 <= code < 600:
+            status = "server_error"
+        else:
+            status = "other"
+        return {"live_status": status, "http_code": code, "live_error": ""}
+    except requests.Timeout:
+        return {"live_status": "timeout", "http_code": 0, "live_error": "Request timed out after 10s"}
+    except requests.RequestException as e:
+        return {"live_status": "error", "http_code": 0, "live_error": f"{type(e).__name__}"}
+
+
+def check_ai_bot_access(domain: str, session: requests.Session | None = None) -> dict:
+    """
+    Runs the robots.txt + live-WAF check for every AI bot in AI_BOTS.
+    Returns a dict safe to attach to the audit result and render in UI/docs.
+    """
+    if session is None:
+        session = requests.Session()
+        session.headers.update({
+            "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-GB,en;q=0.9",
+        })
+
+    parsed = urlparse(domain if "://" in domain else f"https://{domain}")
+    homepage = f"{parsed.scheme or 'https'}://{parsed.netloc or parsed.path.strip('/')}/"
+
+    robots_url, robots_text, robots_err = _fetch_robots_txt(domain, session)
+
+    # Build the per-bot status list
+    bots: list[dict] = []
+
+    # Live checks run concurrently — one HTTP request per bot, capped at 6
+    # workers to be gentle on the target host.
+    live_results: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futs = {
+            pool.submit(_live_check_bot, homepage, bot_ua, session): bot_ua
+            for bot_ua, _, _ in AI_BOTS
+        }
+        for fut in as_completed(futs):
+            bot_ua = futs[fut]
+            try:
+                live_results[bot_ua] = fut.result()
+            except Exception as e:
+                live_results[bot_ua] = {
+                    "live_status": "error", "http_code": 0,
+                    "live_error": f"{type(e).__name__}: {e}",
+                }
+
+    for bot_ua, vendor, purpose in AI_BOTS:
+        rob_status, rob_evidence = _robots_status_for_bot(robots_text, bot_ua)
+        live = live_results.get(bot_ua, {"live_status": "unknown", "http_code": 0, "live_error": ""})
+        # Overall access verdict combines the two signals
+        if rob_status == "blocked_all" or live["live_status"] == "blocked":
+            verdict = "blocked"
+        elif rob_status in ("blocked_partial",) or live["live_status"] in ("timeout", "error", "server_error", "other"):
+            verdict = "partial"
+        else:
+            verdict = "allowed"
+        bots.append({
+            "user_agent":       bot_ua,
+            "vendor":           vendor,
+            "purpose":          purpose,
+            "robots_status":    rob_status,
+            "robots_evidence":  rob_evidence,
+            "live_status":      live["live_status"],
+            "http_code":        live["http_code"],
+            "live_error":       live["live_error"],
+            "verdict":          verdict,
+        })
+
+    summary = {
+        "allowed":  sum(1 for b in bots if b["verdict"] == "allowed"),
+        "partial":  sum(1 for b in bots if b["verdict"] == "partial"),
+        "blocked":  sum(1 for b in bots if b["verdict"] == "blocked"),
+        "total":    len(bots),
+    }
+
+    return {
+        "homepage_checked":    homepage,
+        "robots_txt_url":      robots_url,
+        "robots_txt_found":    bool(robots_text),
+        "robots_txt_content":  robots_text[:8000],  # cap for storage
+        "robots_txt_error":    robots_err,
+        "bots":                bots,
+        "summary":             summary,
+    }
+
 
 # ─── Fetch URL HTML ───────────────────────────────────────────────────────────
 # Hard cap on raw HTML size before we even parse it. On extreme PLPs
@@ -1719,12 +1992,20 @@ def build_onepager(data: dict, month_year: str) -> bytes:
     # Coded values are scaled so total ~= usable page height (785pt).
     # ReportLab adds internal padding on top, so these values are tuned
     # so the content fills the page without overflowing.
+    #
+    # Critical-bot callout: only rendered when a bot in CRITICAL_AI_BOTS
+    # has been blocked. When shown, we shave a little off the score box,
+    # WH content rows and wins row so total budget is unchanged.
+    _blocked_critical_pdf = get_blocked_critical_bots(data.get("bot_access", {}))
+    _show_alert = bool(_blocked_critical_pdf)
+
+    ROW_ALERT = 22 if _show_alert else 0    # red banner right below header
     ROW_HDR  = 33    # logo header
     ROW_HERO = 84    # headline + intro paragraph
-    ROW_SCOR = 84    # score box — large number + labels + verdict line
+    ROW_SCOR = 78 if _show_alert else 84    # score box
     ROW_DIMS = 28    # dimension badge strip
     ROW_WHHD = 29    # WH section header row
-    ROW_WH   = 94    # each WH content row (x3) — title + 3 lines detail
+    ROW_WH   = 89 if _show_alert else 94    # each WH content row (x3)
     ROW_WINS = 25    # "quick wins" label row
     ROW_WNUM = 146   # wins content row — number + title + detail
     ROW_CTA  = 35    # CTA bar
@@ -1769,6 +2050,38 @@ def build_onepager(data: dict, month_year: str) -> bytes:
     ]))
     story.append(hdr_t)
     story.append(Spacer(1, SP1))
+
+    # ═══════════════════════════════════════════════════════════════
+    # 1b. CRITICAL BOT ALERT (only if any critical AI bot is blocked)
+    # ═══════════════════════════════════════════════════════════════
+    if _show_alert:
+        # Build short product list ("ChatGPT, Claude and Perplexity")
+        _products = sorted({b["product"] for b in _blocked_critical_pdf})
+        if len(_products) > 1:
+            _prod_str = ", ".join(_products[:-1]) + " and " + _products[-1]
+        else:
+            _prod_str = _products[0]
+        _uas = ", ".join(b["user_agent"] for b in _blocked_critical_pdf)
+        alert_t = Table(
+            [[P(
+                f'<font name="Helvetica-Bold" size="8" color="#FFFFFF">! CRITICAL — '
+                f'{safe(_prod_str)} cannot crawl this site.</font> '
+                f'<font name="Helvetica" size="7" color="#FFFFFF">'
+                f'Blocked: {safe(_uas)}. AI answers won\u2019t cite pages the crawlers can\u2019t fetch.</font>',
+                leading=10,
+            )]],
+            colWidths=[W],
+            rowHeights=[ROW_ALERT],
+        )
+        alert_t.setStyle(TableStyle([
+            ("BACKGROUND",    (0,0),(-1,-1), RED),
+            ("VALIGN",        (0,0),(-1,-1),"MIDDLE"),
+            ("LEFTPADDING",   (0,0),(-1,-1), 8),
+            ("RIGHTPADDING",  (0,0),(-1,-1), 8),
+            ("TOPPADDING",    (0,0),(-1,-1), 3),
+            ("BOTTOMPADDING", (0,0),(-1,-1), 3),
+        ]))
+        story.append(alert_t)
 
     # ═══════════════════════════════════════════════════════════════
     # 2. HERO HEADLINE + INTRO  (fixed height table so it cannot grow)
@@ -1991,6 +2304,403 @@ def build_onepager(data: dict, month_year: str) -> bytes:
     return buf.getvalue()
 
 
+# ─── Build One-Pager Word doc (editable) ──────────────────────────────────────
+def build_onepager_docx(data: dict, month_year: str) -> bytes:
+    """
+    Editable Word version of the one-pager PDF. Keeps the same seven sections
+    (header, hero, score box, dimension badges, what's working / holding back,
+    quick wins, CTA) plus a short AI-bot-access summary, but as native Word
+    objects so the team can tweak copy before sending it out.
+    """
+    company      = data.get("company_name", "Client")
+    domain       = data.get("domain", "")
+    avg          = round(data.get("average_score", 0))
+    dim_avg      = data.get("dimension_averages", {}) or {}
+    if not isinstance(dim_avg, dict):
+        dim_avg = {}
+    exec_summary = data.get("executive_summary", "") or ""
+    working      = (data.get("whats_working", []) or [])[:3]
+    holding      = (data.get("whats_holding_back", []) or [])[:3]
+    wins         = (data.get("three_quick_wins", []) or [])[:3]
+    bot_access   = data.get("bot_access", {}) or {}
+
+    dim_keys   = ["aria","schema","headings","meta","links","alt_text","crawl","llm","content_quality"]
+    dim_labels = ["ARIA","SCHEMA","HEADINGS","META","LINKS","ALT TEXT","CRAWL","LLM","CONTENT"]
+
+    RED   = RGBColor(0xD9, 0x3B, 0x1A)
+    DARK  = RGBColor(0x1A, 0x1A, 0x1A)
+    GREY  = RGBColor(0x6B, 0x6B, 0x6B)
+    GREEN = RGBColor(0x27, 0xAE, 0x60)
+    AMBER = RGBColor(0xE6, 0x7E, 0x22)
+    RED2  = RGBColor(0xC0, 0x39, 0x2B)
+    WHITE = RGBColor(0xFF, 0xFF, 0xFF)
+    LIGHT_HEX = "F5F4F2"
+    GREY_HEX  = "DDDDDD"
+
+    def dim_hex(s):
+        try:
+            s = float(s)
+        except (TypeError, ValueError):
+            s = 0
+        if s <= 2: return "C0392B"
+        if s <= 5: return "E67E22"
+        return "27AE60"
+
+    def clean(t):
+        return str(t or "").replace("`", "").replace("\u2014", ",").replace("\u2013", ",").strip()
+
+    # ── Document setup ──────────────────────────────────────────────
+    doc = Document()
+
+    # Page margins (approx match to PDF: 13mm sides, 10mm top/bottom)
+    for section in doc.sections:
+        section.top_margin    = Mm(12)
+        section.bottom_margin = Mm(12)
+        section.left_margin   = Mm(14)
+        section.right_margin  = Mm(14)
+
+    # Default font
+    style = doc.styles["Normal"]
+    style.font.name = "Calibri"
+    style.font.size = Pt(10)
+
+    def _shade(cell, hex_color):
+        """Add background shading to a table cell."""
+        tc_pr = cell._tc.get_or_add_tcPr()
+        shd = OxmlElement("w:shd")
+        shd.set(qn("w:val"), "clear")
+        shd.set(qn("w:color"), "auto")
+        shd.set(qn("w:fill"), hex_color)
+        tc_pr.append(shd)
+
+    def _remove_cell_margins(cell, top=60, bottom=60, left=100, right=100):
+        """Set cell margins in twentieths of a point."""
+        tc_pr = cell._tc.get_or_add_tcPr()
+        mar = OxmlElement("w:tcMar")
+        for side, val in (("top", top), ("bottom", bottom), ("left", left), ("right", right)):
+            node = OxmlElement(f"w:{side}")
+            node.set(qn("w:w"), str(val))
+            node.set(qn("w:type"), "dxa")
+            mar.append(node)
+        tc_pr.append(mar)
+
+    def _cell_border(cell, side, size_eighths=8, color="D93B1A"):
+        """Add a single border to a cell (single line, size in 1/8 pt)."""
+        tc_pr = cell._tc.get_or_add_tcPr()
+        borders = tc_pr.find(qn("w:tcBorders"))
+        if borders is None:
+            borders = OxmlElement("w:tcBorders")
+            tc_pr.append(borders)
+        border = OxmlElement(f"w:{side}")
+        border.set(qn("w:val"), "single")
+        border.set(qn("w:sz"), str(size_eighths))
+        border.set(qn("w:color"), color)
+        borders.append(border)
+
+    def _add_run(paragraph, text, *, bold=False, italic=False, size=None, color=None, font=None):
+        run = paragraph.add_run(text)
+        run.bold = bold
+        run.italic = italic
+        if size is not None:
+            run.font.size = Pt(size)
+        if color is not None:
+            run.font.color.rgb = color
+        if font is not None:
+            run.font.name = font
+        return run
+
+    def _clear_paragraph_spacing(p):
+        pf = p.paragraph_format
+        pf.space_before = Pt(0)
+        pf.space_after  = Pt(0)
+
+    # ═══════════════════════════════════════════════════════════════
+    # 1. HEADER — logo left, snapshot label right, red rule underneath
+    # ═══════════════════════════════════════════════════════════════
+    hdr_tbl = doc.add_table(rows=1, cols=2)
+    hdr_tbl.autofit = False
+    hdr_tbl.columns[0].width = Cm(3)
+    hdr_tbl.columns[1].width = Cm(15.5)
+
+    logo_cell = hdr_tbl.cell(0, 0)
+    logo_p = logo_cell.paragraphs[0]
+    _clear_paragraph_spacing(logo_p)
+    if os.path.exists(LOGO_PATH):
+        try:
+            logo_p.add_run().add_picture(LOGO_PATH, width=Cm(1.6))
+        except Exception:
+            _add_run(logo_p, "SUMMIT", bold=True, size=11, color=RED)
+    else:
+        _add_run(logo_p, "SUMMIT", bold=True, size=11, color=RED)
+
+    label_cell = hdr_tbl.cell(0, 1)
+    label_p = label_cell.paragraphs[0]
+    label_p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    _clear_paragraph_spacing(label_p)
+    _add_run(label_p, "AI VISIBILITY SNAPSHOT\n", size=7, color=GREY)
+    _add_run(label_p, f"{company.upper()} · {month_year.upper()}", size=7, color=GREY)
+    _cell_border(label_cell, "bottom", size_eighths=12, color="D93B1A")
+    _cell_border(logo_cell,  "bottom", size_eighths=12, color="D93B1A")
+
+    doc.add_paragraph()  # spacer
+
+    # ═══════════════════════════════════════════════════════════════
+    # 1b. CRITICAL BOT ALERT (only if any critical AI bot is blocked)
+    # ═══════════════════════════════════════════════════════════════
+    _blocked_critical_docx = get_blocked_critical_bots(bot_access)
+    if _blocked_critical_docx:
+        _products = sorted({b["product"] for b in _blocked_critical_docx})
+        if len(_products) > 1:
+            _prod_str = ", ".join(_products[:-1]) + " and " + _products[-1]
+        else:
+            _prod_str = _products[0]
+        _uas = ", ".join(b["user_agent"] for b in _blocked_critical_docx)
+
+        alert_tbl = doc.add_table(rows=1, cols=1)
+        alert_tbl.autofit = False
+        alert_tbl.columns[0].width = Cm(18.5)
+        acell = alert_tbl.cell(0, 0)
+        _shade(acell, "D93B1A")
+        _remove_cell_margins(acell, top=80, bottom=80, left=160, right=160)
+        acell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+        ap = acell.paragraphs[0]
+        _clear_paragraph_spacing(ap)
+        _add_run(ap, f"!  CRITICAL — {_prod_str} cannot crawl this site.  ",
+                 bold=True, size=10, color=WHITE)
+        _add_run(ap, f"Blocked: {_uas}. AI answers won't cite pages the crawlers can't fetch.",
+                 size=8, color=WHITE)
+        doc.add_paragraph()  # spacer
+
+    # ═══════════════════════════════════════════════════════════════
+    # 2. HERO HEADLINE
+    # ═══════════════════════════════════════════════════════════════
+    if "OVERVIEW:" in exec_summary.upper():
+        ov = exec_summary.split("|")[0]
+        ci = ov.find(":")
+        intro_raw = clean(ov[ci+1:].strip()) if ci != -1 else clean(ov)
+    else:
+        intro_raw = clean(exec_summary)
+
+    hero_p = doc.add_paragraph()
+    _clear_paragraph_spacing(hero_p)
+    _add_run(hero_p, "Is your site ready for the ", bold=True, size=22, color=DARK)
+    _add_run(hero_p, "AI search era?", bold=True, italic=True, size=22, color=RED)
+
+    intro_p = doc.add_paragraph()
+    _clear_paragraph_spacing(intro_p)
+    intro_p.paragraph_format.space_after = Pt(6)
+    _add_run(intro_p, f"We audited {domain} the way ChatGPT, Perplexity, Gemini and Claude see it. ",
+             bold=True, size=9, color=DARK)
+    _add_run(intro_p, intro_raw, size=9, color=DARK)
+
+    # ═══════════════════════════════════════════════════════════════
+    # 3. SCORE BOX
+    # ═══════════════════════════════════════════════════════════════
+    verdict_text = ""
+    if "VERDICT:" in exec_summary.upper():
+        for part in exec_summary.split("|"):
+            if "VERDICT:" in part.upper():
+                ci = part.find(":")
+                verdict_text = clean(part[ci+1:].strip()) if ci != -1 else ""
+                break
+
+    score_tbl = doc.add_table(rows=1, cols=2)
+    score_tbl.autofit = False
+    score_tbl.columns[0].width = Cm(4)
+    score_tbl.columns[1].width = Cm(14.5)
+
+    num_cell = score_tbl.cell(0, 0)
+    txt_cell = score_tbl.cell(0, 1)
+    _shade(num_cell, LIGHT_HEX)
+    _shade(txt_cell, LIGHT_HEX)
+    num_cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+    txt_cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+
+    num_p = num_cell.paragraphs[0]
+    num_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _clear_paragraph_spacing(num_p)
+    _add_run(num_p, str(avg), bold=True, size=44, color=RED)
+    _add_run(num_p, "/90", size=14, color=GREY)
+
+    lbl_p = txt_cell.paragraphs[0]
+    _clear_paragraph_spacing(lbl_p)
+    _add_run(lbl_p, "AVERAGE PAGE SCORE\n", size=7, color=GREY)
+    _add_run(lbl_p, "A solid foundation. ", bold=True, size=14, color=DARK)
+    _add_run(lbl_p, "A clear AI gap.", bold=True, size=14, color=RED)
+    if verdict_text:
+        vp = txt_cell.add_paragraph()
+        _clear_paragraph_spacing(vp)
+        _add_run(vp, verdict_text, size=8, color=GREY)
+
+    doc.add_paragraph()  # spacer
+
+    # ═══════════════════════════════════════════════════════════════
+    # 4. DIMENSION BADGES (9-cell coloured strip)
+    # ═══════════════════════════════════════════════════════════════
+    dims_tbl = doc.add_table(rows=1, cols=9)
+    dims_tbl.autofit = False
+    for c in dims_tbl.columns:
+        c.width = Cm(2.05)
+    for i, (dk, dl) in enumerate(zip(dim_keys, dim_labels)):
+        cell = dims_tbl.cell(0, i)
+        s = dim_avg.get(dk, 0) or 0
+        _shade(cell, dim_hex(s))
+        p = cell.paragraphs[0]
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        _clear_paragraph_spacing(p)
+        _add_run(p, dl, bold=True, size=6, color=WHITE)
+        p2 = cell.add_paragraph()
+        p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        _clear_paragraph_spacing(p2)
+        _add_run(p2, str(s), bold=True, size=13, color=WHITE)
+        _add_run(p2, "/10", size=7, color=WHITE)
+
+    doc.add_paragraph()  # spacer
+
+    # ═══════════════════════════════════════════════════════════════
+    # 5. WHAT'S WORKING / WHAT'S HOLDING BACK  — side by side
+    # ═══════════════════════════════════════════════════════════════
+    def _fill_side(cell, header_text, header_hex, icon, icon_color, items):
+        # Header row
+        first = cell.paragraphs[0]
+        _clear_paragraph_spacing(first)
+        _shade(cell, "FFFFFF")
+        # Sub-table inside the outer cell for header + items
+        sub = cell.add_table(rows=4, cols=1)
+        sub.autofit = False
+        try:
+            sub.columns[0].width = Cm(9)
+        except Exception:
+            pass
+        hdr = sub.cell(0, 0)
+        _shade(hdr, header_hex)
+        hp = hdr.paragraphs[0]
+        _clear_paragraph_spacing(hp)
+        _add_run(hp, header_text, bold=True, size=9, color=WHITE)
+        for i, it in enumerate((items + [{}, {}, {}])[:3]):
+            body = sub.cell(i + 1, 0)
+            _shade(body, "F9F9F9")
+            _remove_cell_margins(body, top=80, bottom=80, left=140, right=140)
+            bp = body.paragraphs[0]
+            _clear_paragraph_spacing(bp)
+            pt  = clean(it.get("point", "")) if it else ""
+            det = clean(it.get("detail", "")) if it else ""
+            if pt:
+                _add_run(bp, f"{icon}  ", bold=True, size=9, color=icon_color)
+                _add_run(bp, pt, bold=True, size=9, color=DARK)
+                if det:
+                    dp = body.add_paragraph()
+                    _clear_paragraph_spacing(dp)
+                    _add_run(dp, det, size=8, color=RGBColor(0x4A, 0x4A, 0x4A))
+            else:
+                _add_run(bp, " ", size=9)
+        # Remove the empty first paragraph we started with
+        # (python-docx always seeds a cell with one paragraph)
+        p0 = cell.paragraphs[0]
+        if p0.text == "" and len(cell.paragraphs) > 1:
+            p0._element.getparent().remove(p0._element)
+
+    sides_tbl = doc.add_table(rows=1, cols=2)
+    sides_tbl.autofit = False
+    sides_tbl.columns[0].width = Cm(9)
+    sides_tbl.columns[1].width = Cm(9)
+
+    _fill_side(sides_tbl.cell(0, 0), "✚  WHAT'S WORKING",
+               "27AE60", "✚", GREEN, working)
+    _fill_side(sides_tbl.cell(0, 1), "!  WHAT'S HOLDING YOU BACK",
+               "D93B1A", "!", RED, holding)
+
+    doc.add_paragraph()
+
+    # ═══════════════════════════════════════════════════════════════
+    # 6. THREE QUICK WINS
+    # ═══════════════════════════════════════════════════════════════
+    label_p = doc.add_paragraph()
+    _clear_paragraph_spacing(label_p)
+    _add_run(label_p, "THREE MOVES THAT MOVE THE NEEDLE\n", size=7, color=GREY)
+    _add_run(label_p, "Quick wins, big impact", bold=True, size=13, color=DARK)
+
+    wins_tbl = doc.add_table(rows=1, cols=3)
+    wins_tbl.autofit = False
+    for c in wins_tbl.columns:
+        c.width = Cm(6.15)
+    for i, w in enumerate((wins + [{}, {}, {}])[:3]):
+        cell = wins_tbl.cell(0, i)
+        _remove_cell_margins(cell, top=80, bottom=80, left=140, right=140)
+        num    = clean(w.get("number", "")) if w else str(i + 1)
+        title  = clean(w.get("title", ""))  if w else ""
+        detail = clean(w.get("detail", "")) if w else ""
+
+        np = cell.paragraphs[0]
+        _clear_paragraph_spacing(np)
+        _add_run(np, num or str(i + 1), bold=True, size=22, color=RED)
+
+        if title:
+            tp = cell.add_paragraph()
+            _clear_paragraph_spacing(tp)
+            _add_run(tp, title, bold=True, size=9, color=DARK)
+        if detail:
+            dp = cell.add_paragraph()
+            _clear_paragraph_spacing(dp)
+            _add_run(dp, detail, size=8, color=RGBColor(0x4A, 0x4A, 0x4A))
+        if i < 2:
+            _cell_border(cell, "right", size_eighths=4, color="DDDDDD")
+
+    doc.add_paragraph()
+
+    # ═══════════════════════════════════════════════════════════════
+    # 6b. AI BOT ACCESS — compact strip (new)
+    # ═══════════════════════════════════════════════════════════════
+    if bot_access and bot_access.get("bots"):
+        summary = bot_access.get("summary", {})
+        ba_hdr = doc.add_paragraph()
+        _clear_paragraph_spacing(ba_hdr)
+        _add_run(ba_hdr, "AI BOT ACCESS  ", size=7, color=GREY)
+        _add_run(ba_hdr, f"{summary.get('allowed', 0)} allowed  ", bold=True, size=8, color=GREEN)
+        _add_run(ba_hdr, f"·  {summary.get('partial', 0)} partial  ", bold=True, size=8, color=AMBER)
+        _add_run(ba_hdr, f"·  {summary.get('blocked', 0)} blocked  ", bold=True, size=8, color=RED2)
+        _add_run(ba_hdr, f"of {summary.get('total', 0)} AI bots checked", size=7, color=GREY)
+
+        blocked_bots = [b for b in bot_access["bots"] if b.get("verdict") == "blocked"]
+        if blocked_bots:
+            bp = doc.add_paragraph()
+            _clear_paragraph_spacing(bp)
+            _add_run(bp, "Blocked: ", bold=True, size=8, color=DARK)
+            _add_run(bp, ", ".join(f"{b['user_agent']} ({b['vendor']})" for b in blocked_bots[:6]),
+                     size=8, color=DARK)
+        doc.add_paragraph()
+
+    # ═══════════════════════════════════════════════════════════════
+    # 7. CTA BAR
+    # ═══════════════════════════════════════════════════════════════
+    cta_tbl = doc.add_table(rows=1, cols=2)
+    cta_tbl.autofit = False
+    cta_tbl.columns[0].width = Cm(9.5)
+    cta_tbl.columns[1].width = Cm(9)
+    left = cta_tbl.cell(0, 0)
+    right = cta_tbl.cell(0, 1)
+    _shade(right, LIGHT_HEX)
+    _cell_border(left, "top", size_eighths=16, color="D93B1A")
+    _cell_border(right, "top", size_eighths=16, color="D93B1A")
+    left.vertical_alignment  = WD_ALIGN_VERTICAL.CENTER
+    right.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+
+    lp = left.paragraphs[0]
+    _clear_paragraph_spacing(lp)
+    _add_run(lp, "We'll walk your team through\nevery finding. ",
+             bold=True, size=11, color=DARK)
+    _add_run(lp, "No obligation.", bold=True, italic=True, size=11, color=RED)
+
+    rp = right.paragraphs[0]
+    rp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _clear_paragraph_spacing(rp)
+    _add_run(rp, "BOOK A SESSION\n", size=7, color=GREY)
+    _add_run(rp, "hello@summitmedia.com", bold=True, size=12, color=DARK)
+
+    # ── Save & return bytes ─────────────────────────────────────────
+    buf = BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
 
 
 # ─── Streamlit UI ─────────────────────────────────────────────────────────────
@@ -2137,7 +2847,17 @@ if run:
                 )
             st.stop()
 
-    # Pre-generate both files while we have the data
+    # ── AI bot access + robots.txt check ─────────────────────────────────
+    # Runs after the Gemini audit so a failure here can't kill the audit.
+    # Attached to the audit dict so it flows into every downstream output.
+    with st.spinner("Checking AI bot access & robots.txt…"):
+        try:
+            audit["bot_access"] = check_ai_bot_access(domain)
+        except Exception as e:
+            audit["bot_access"] = {"error": f"{type(e).__name__}: {e}", "bots": [],
+                                    "summary": {"allowed": 0, "partial": 0, "blocked": 0, "total": 0}}
+
+    # Pre-generate all download files while we have the data
     with st.spinner("Building Word document…"):
         try:
             docx_bytes = build_docx(audit, month_year)
@@ -2152,11 +2872,19 @@ if run:
             pdf_bytes = None
             st.warning(f"PDF error: {e}")
 
+    with st.spinner("Building one-pager Word doc…"):
+        try:
+            onepager_docx_bytes = build_onepager_docx(audit, month_year)
+        except Exception as e:
+            onepager_docx_bytes = None
+            st.warning(f"One-pager Word error: {e}")
+
     # Store everything — survives download-button reruns
-    st.session_state["audit"]      = audit
-    st.session_state["month_year"] = month_year
-    st.session_state["docx_bytes"] = docx_bytes
-    st.session_state["pdf_bytes"]  = pdf_bytes
+    st.session_state["audit"]              = audit
+    st.session_state["month_year"]         = month_year
+    st.session_state["docx_bytes"]         = docx_bytes
+    st.session_state["pdf_bytes"]          = pdf_bytes
+    st.session_state["onepager_docx_bytes"] = onepager_docx_bytes
 
 # ── Display results from session_state (persists across reruns) ────────────
 if "audit" in st.session_state:
@@ -2172,6 +2900,26 @@ if "audit" in st.session_state:
     dim_labels = ["ARIA","SCHEMA","HEADINGS","META","LINKS","ALT TEXT","CRAWL","LLM","CONTENT"]
 
     st.markdown(f"## 📊 Results: {company}")
+
+    # ── Critical AI bot access alert (top-of-page banner) ─────────────────
+    # If any of ChatGPT / Claude / Perplexity / Gemini can't crawl the site,
+    # nothing else in the audit matters as much as that fact. Show it first.
+    _blocked_critical = get_blocked_critical_bots(audit.get("bot_access", {}))
+    if _blocked_critical:
+        products = sorted({b["product"] for b in _blocked_critical})
+        products_str = ", ".join(products[:-1]) + (f" and {products[-1]}" if len(products) > 1 else products[0])
+        bullet_lines = "\n".join(
+            f"- **{b['product']}** — `{b['user_agent']}` blocked ({b['robots_evidence'] if b['robots_status'].startswith('blocked') else 'live fetch returned ' + str(b['http_code'])})"
+            for b in _blocked_critical
+        )
+        st.error(
+            f"🚫 **Critical AI crawler{'s' if len(_blocked_critical) > 1 else ''} blocked — "
+            f"{products_str} cannot access this site.**\n\n"
+            f"This overrides everything else in the audit. Even a perfect score won't earn "
+            f"AI citations if the crawlers that feed those products can't fetch your pages.\n\n"
+            f"{bullet_lines}\n\n"
+            f"See the **AI Bot Access** section below for the full breakdown and remediation."
+        )
 
     # Score overview
     c1, c2 = st.columns([1, 3])
@@ -2248,17 +2996,68 @@ if "audit" in st.session_state:
             "Owner": r.get("owner",""),
         } for r in recs])
 
+    # ── AI bot access (robots.txt + live WAF check) ───────────────────────
+    ba = audit.get("bot_access") or {}
+    if ba and ba.get("bots"):
+        st.markdown("### 🤖 AI Bot Access & robots.txt")
+        s = ba.get("summary", {})
+        # Traffic-light summary row
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Allowed",       s.get("allowed", 0))
+        m2.metric("Partial",       s.get("partial", 0))
+        m3.metric("Blocked",       s.get("blocked", 0))
+        m4.metric("Bots checked",  s.get("total", 0))
+
+        if ba.get("robots_txt_found"):
+            st.caption(f"✅ robots.txt found at `{ba.get('robots_txt_url','')}`")
+        else:
+            err = ba.get("robots_txt_error", "")
+            st.caption(f"⚠️ No robots.txt found. {err}")
+
+        # Per-bot table
+        verdict_icon = {"allowed": "✅ Allowed", "partial": "🟡 Partial", "blocked": "🚫 Blocked"}
+        rob_label = {
+            "blocked_all":     "Blocked (all)",
+            "blocked_partial": "Blocked (paths)",
+            "allowed":         "Allowed",
+            "not_specified":   "Not specified",
+            "no_robots":       "No robots.txt",
+        }
+        live_label = {
+            "allowed":      "200 OK",
+            "blocked":      "Blocked",
+            "server_error": "Server error",
+            "timeout":      "Timeout",
+            "error":        "Network error",
+            "other":        "Other",
+            "unknown":      "Unknown",
+        }
+        st.table([{
+            "Bot":         b["user_agent"],
+            "Vendor":      b["vendor"],
+            "Overall":     verdict_icon.get(b["verdict"], b["verdict"]),
+            "robots.txt":  rob_label.get(b["robots_status"], b["robots_status"]),
+            "Live check":  f"{live_label.get(b['live_status'], b['live_status'])}"
+                           + (f" (HTTP {b['http_code']})" if b['http_code'] else ""),
+            "Purpose":     b["purpose"],
+        } for b in ba["bots"]])
+
+        if ba.get("robots_txt_content"):
+            with st.expander("View robots.txt contents"):
+                st.code(ba["robots_txt_content"], language="text")
+
     # ── Download buttons — data already in memory, no recompute ───────────
     st.markdown("---")
     st.markdown("### 📥 Download Outputs")
-    col_d, col_p = st.columns(2)
+    col_d, col_p, col_op = st.columns(3)
 
     slug = company.lower().replace(' ', '-').replace('.', '')
+    onepager_docx_bytes = st.session_state.get("onepager_docx_bytes")
 
     with col_d:
         if docx_bytes:
             st.download_button(
-                "⬇️ Download Full Audit (.docx)",
+                "⬇️ Full Audit (.docx)",
                 data=docx_bytes,
                 file_name=f"summit-ai-audit-{slug}.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -2266,12 +3065,12 @@ if "audit" in st.session_state:
                 key="dl_docx",
             )
         else:
-            st.error("Word document could not be generated.")
+            st.error("Full audit Word doc could not be generated.")
 
     with col_p:
         if pdf_bytes:
             st.download_button(
-                "⬇️ Download One-Pager (.pdf)",
+                "⬇️ One-Pager (.pdf)",
                 data=pdf_bytes,
                 file_name=f"summit-ai-snapshot-{slug}.pdf",
                 mime="application/pdf",
@@ -2279,12 +3078,26 @@ if "audit" in st.session_state:
                 key="dl_pdf",
             )
         else:
-            st.error("PDF could not be generated.")
+            st.error("One-pager PDF could not be generated.")
+
+    with col_op:
+        if onepager_docx_bytes:
+            st.download_button(
+                "⬇️ One-Pager (.docx)",
+                data=onepager_docx_bytes,
+                file_name=f"summit-ai-snapshot-{slug}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True,
+                key="dl_onepager_docx",
+                help="Editable Word version of the one-pager — useful if you want to tweak copy before sending.",
+            )
+        else:
+            st.error("One-pager Word doc could not be generated.")
 
     # Clear results button
     st.markdown("<br>", unsafe_allow_html=True)
     if st.button("🗑️ Clear & run new audit"):
-        for k in ["audit","month_year","docx_bytes","pdf_bytes"]:
+        for k in ["audit","month_year","docx_bytes","pdf_bytes","onepager_docx_bytes"]:
             st.session_state.pop(k, None)
         st.rerun()
 
