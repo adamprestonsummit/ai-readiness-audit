@@ -1453,6 +1453,27 @@ def build_docx(data: dict, month_year: str) -> bytes:
     """
     import tempfile, os, subprocess, json as _json
 
+    # Resolve `node` and `npm` executables.
+    # On Streamlit Cloud we install nodejs via the `nodejs-bin` pip package
+    # (Debian bullseye's apt is broken since EOL), which puts binaries inside
+    # a Python package directory rather than on PATH. Locally, developers may
+    # have system Node.js instead. Try nodejs-bin first, fall back to PATH.
+    def _resolve_node_binaries():
+        try:
+            import nodejs  # provided by the `nodejs-bin` PyPI package
+            # nodejs-bin exposes callable wrappers with a `path` attribute
+            node_bin = getattr(nodejs.node, "path", None)
+            npm_bin  = getattr(nodejs.npm,  "path", None)
+            if node_bin and npm_bin and os.path.exists(node_bin) and os.path.exists(npm_bin):
+                return node_bin, npm_bin
+        except Exception:
+            pass
+        # Fallback: system PATH
+        import shutil
+        return shutil.which("node") or "node", shutil.which("npm") or "npm"
+
+    NODE_BIN, NPM_BIN = _resolve_node_binaries()
+
     dim_keys   = ["aria","schema","headings","meta","links","alt_text","crawl","llm","content_quality"]
     dim_labels = ["ARIA","SCHEMA","HEADINGS","META","LINKS","ALT TEXT","CRAWL","LLM","CONTENT"]
 
@@ -1509,7 +1530,7 @@ def build_docx(data: dict, month_year: str) -> bytes:
     node_modules = os.path.join(app_dir, "node_modules")
     if not os.path.exists(os.path.join(node_modules, "docx")):
         subprocess.run(
-            ["npm", "install", "docx", "--prefix", app_dir],
+            [NPM_BIN, "install", "docx", "--prefix", app_dir],
             capture_output=True, timeout=120
         )
 
@@ -1903,11 +1924,11 @@ Packer.toBuffer(doc).then(function(buf) {
     # Include both local (app dir) and global npm paths
     local_modules  = os.path.join(app_dir, "node_modules")
     global_modules = subprocess.run(
-        ["npm", "root", "-g"], capture_output=True, text=True
+        [NPM_BIN, "root", "-g"], capture_output=True, text=True
     ).stdout.strip()
     env["NODE_PATH"] = local_modules + os.pathsep + global_modules
     result = subprocess.run(
-        ["node", script_file.name, data_file.name, out_path],
+        [NODE_BIN, script_file.name, data_file.name, out_path],
         capture_output=True, text=True, timeout=90,
         env=env
     )
