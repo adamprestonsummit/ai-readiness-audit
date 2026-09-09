@@ -1455,24 +1455,83 @@ def build_docx(data: dict, month_year: str) -> bytes:
 
     # Resolve `node` and `npm` executables.
     # On Streamlit Cloud we install nodejs via the `nodejs-bin` pip package
-    # (Debian bullseye's apt is broken since EOL), which puts binaries inside
-    # a Python package directory rather than on PATH. Locally, developers may
-    # have system Node.js instead. Try nodejs-bin first, fall back to PATH.
+    # (Debian bullseye's apt is broken since EOL), which bundles the binaries
+    # inside its own Python package directory rather than putting them on PATH.
+    # Locally, developers may have system Node.js instead. Try the bundled
+    # binaries first, then fall back to system PATH.
     def _resolve_node_binaries():
+        import shutil, glob
+        # 1. Try nodejs-bin — look inside its package dir for the actual binaries.
+        #    Layout differs slightly between versions, so we search a few
+        #    candidate locations rather than hard-coding one.
         try:
-            import nodejs  # provided by the `nodejs-bin` PyPI package
-            # nodejs-bin exposes callable wrappers with a `path` attribute
-            node_bin = getattr(nodejs.node, "path", None)
-            npm_bin  = getattr(nodejs.npm,  "path", None)
-            if node_bin and npm_bin and os.path.exists(node_bin) and os.path.exists(npm_bin):
-                return node_bin, npm_bin
+            import nodejs
+            pkg_dir = os.path.dirname(os.path.abspath(nodejs.__file__))
+            candidate_dirs = [
+                pkg_dir,
+                os.path.join(pkg_dir, "node_bin"),
+                os.path.join(pkg_dir, "bin"),
+                os.path.join(pkg_dir, "node", "bin"),
+            ]
+            # Also handle any nested "node-vXX.YY.Z-linux-x64/bin" style layout
+            for match in glob.glob(os.path.join(pkg_dir, "node-*", "bin")):
+                candidate_dirs.append(match)
+
+            node_found = npm_found = None
+            for d in candidate_dirs:
+                if not os.path.isdir(d):
+                    continue
+                for n in ("node",):
+                    p = os.path.join(d, n)
+                    if os.path.isfile(p) and os.access(p, os.X_OK):
+                        node_found = p
+                        break
+                for n in ("npm", "npm-cli.js"):
+                    p = os.path.join(d, n)
+                    if os.path.isfile(p):
+                        npm_found = p
+                        break
+                if node_found and npm_found:
+                    break
+
+            if node_found and npm_found:
+                return node_found, npm_found
+
+            # 2. Fall back to the wrapper API if the file-scan missed the layout.
+            #    We can't return a "binary" — we return a marker that _run_npm /
+            #    _run_node will detect and invoke the API instead.
+            if hasattr(nodejs, "node") and hasattr(nodejs, "npm"):
+                return ("__NODEJS_BIN_API__", "__NODEJS_BIN_API__")
         except Exception:
             pass
-        # Fallback: system PATH
-        import shutil
+
+        # 3. System PATH — the "just installed nodejs yourself" case.
         return shutil.which("node") or "node", shutil.which("npm") or "npm"
 
     NODE_BIN, NPM_BIN = _resolve_node_binaries()
+
+    def _run_binary(kind: str, args: list, **kw):
+        """kind is 'node' or 'npm'. Uses nodejs-bin's wrapper API when the
+        resolver returned the __NODEJS_BIN_API__ marker; otherwise plain
+        subprocess.run against the resolved (or system) binary path."""
+        bin_path = NODE_BIN if kind == "node" else NPM_BIN
+        if bin_path == "__NODEJS_BIN_API__":
+            import nodejs
+            wrapper = getattr(nodejs, kind)
+            # nodejs-bin exposes .run() that returns a CompletedProcess-like
+            # object; older versions only have .call() returning an int.
+            if hasattr(wrapper, "run"):
+                return wrapper.run(args, **kw)
+            code = wrapper.call(args)
+            return subprocess.CompletedProcess(
+                args=[kind, *args], returncode=code, stdout=b"", stderr=b""
+            )
+        # For npm-cli.js (a .js file, not an executable) we have to run it
+        # through node explicitly.
+        if kind == "npm" and bin_path.endswith(".js"):
+            node_bin = NODE_BIN if NODE_BIN != "__NODEJS_BIN_API__" else "node"
+            return subprocess.run([node_bin, bin_path, *args], **kw)
+        return subprocess.run([bin_path, *args], **kw)
 
     dim_keys   = ["aria","schema","headings","meta","links","alt_text","crawl","llm","content_quality"]
     dim_labels = ["ARIA","SCHEMA","HEADINGS","META","LINKS","ALT TEXT","CRAWL","LLM","CONTENT"]
@@ -1529,8 +1588,8 @@ def build_docx(data: dict, month_year: str) -> bytes:
     app_dir = os.path.dirname(os.path.abspath(__file__))
     node_modules = os.path.join(app_dir, "node_modules")
     if not os.path.exists(os.path.join(node_modules, "docx")):
-        subprocess.run(
-            [NPM_BIN, "install", "docx", "--prefix", app_dir],
+        _run_binary("npm",
+            ["install", "docx", "--prefix", app_dir],
             capture_output=True, timeout=120
         )
 
@@ -1923,12 +1982,12 @@ Packer.toBuffer(doc).then(function(buf) {
     env = os.environ.copy()
     # Include both local (app dir) and global npm paths
     local_modules  = os.path.join(app_dir, "node_modules")
-    global_modules = subprocess.run(
-        [NPM_BIN, "root", "-g"], capture_output=True, text=True
+    global_modules = _run_binary("npm",
+        ["root", "-g"], capture_output=True, text=True
     ).stdout.strip()
     env["NODE_PATH"] = local_modules + os.pathsep + global_modules
-    result = subprocess.run(
-        [NODE_BIN, script_file.name, data_file.name, out_path],
+    result = _run_binary("node",
+        [script_file.name, data_file.name, out_path],
         capture_output=True, text=True, timeout=90,
         env=env
     )
