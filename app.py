@@ -1473,33 +1473,54 @@ def build_docx(data: dict, month_year: str) -> bytes:
                 os.path.join(pkg_dir, "bin"),
                 os.path.join(pkg_dir, "node", "bin"),
             ]
-            # Also handle any nested "node-vXX.YY.Z-linux-x64/bin" style layout
             for match in glob.glob(os.path.join(pkg_dir, "node-*", "bin")):
                 candidate_dirs.append(match)
 
-            node_found = npm_found = None
+            # Find node (must be a real, executable binary)
+            node_found = None
             for d in candidate_dirs:
                 if not os.path.isdir(d):
                     continue
-                for n in ("node",):
-                    p = os.path.join(d, n)
+                p = os.path.join(d, "node")
+                if os.path.isfile(p) and os.access(p, os.X_OK):
+                    node_found = p
+                    break
+
+            # Find npm — but PREFER npm-cli.js over the bin/npm wrapper script.
+            # The wrapper is a POSIX shell script whose shebang can be broken
+            # inside pip-installed layouts ("Exec format error"). npm-cli.js
+            # is a plain JavaScript file we can hand straight to node, which
+            # is exactly what the wrapper does anyway.
+            npm_found = None
+            js_candidates = []
+            # Common layouts, in preference order
+            for base in [pkg_dir] + candidate_dirs:
+                js_candidates.append(os.path.join(base, "lib", "node_modules", "npm", "bin", "npm-cli.js"))
+                js_candidates.append(os.path.join(base, "node_modules", "npm", "bin", "npm-cli.js"))
+                # Relative to a bin/ dir found earlier
+                if os.path.basename(base) == "bin":
+                    parent = os.path.dirname(base)
+                    js_candidates.append(os.path.join(parent, "lib", "node_modules", "npm", "bin", "npm-cli.js"))
+            # Last-resort recursive search inside the package
+            js_candidates.extend(glob.glob(os.path.join(pkg_dir, "**", "npm-cli.js"), recursive=True))
+
+            for p in js_candidates:
+                if os.path.isfile(p):
+                    npm_found = p   # returned as a .js path; _run_binary will invoke via node
+                    break
+
+            # Absolute fallback: use bin/npm if it happens to actually work
+            if not npm_found:
+                for d in candidate_dirs:
+                    p = os.path.join(d, "npm")
                     if os.path.isfile(p) and os.access(p, os.X_OK):
-                        node_found = p
-                        break
-                for n in ("npm", "npm-cli.js"):
-                    p = os.path.join(d, n)
-                    if os.path.isfile(p):
                         npm_found = p
                         break
-                if node_found and npm_found:
-                    break
 
             if node_found and npm_found:
                 return node_found, npm_found
 
-            # 2. Fall back to the wrapper API if the file-scan missed the layout.
-            #    We can't return a "binary" — we return a marker that _run_npm /
-            #    _run_node will detect and invoke the API instead.
+            # 2. Wrapper API fallback
             if hasattr(nodejs, "node") and hasattr(nodejs, "npm"):
                 return ("__NODEJS_BIN_API__", "__NODEJS_BIN_API__")
         except Exception:
