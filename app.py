@@ -616,13 +616,93 @@ def extract_page_signals(url: str, html: str) -> str:
     out.append(f"LINKS (total found: {len(all_links)}):\n" + "\n".join(link_sample[:25]))
 
     # ── Images / alt text ─────────────────────────────────────────────
+    # The naive approach (first 20 images) is unrepresentative because on
+    # e-commerce and content sites the first 20 <img> tags are almost always
+    # header nav / mega-menu / footer icons, not the actual page content.
+    # Also, alt="" is legitimately used for decorative images when adjacent
+    # link text provides the accessible name — the WCAG-correct pattern.
+    # So we: (1) filter tracking pixels, (2) classify every image into one
+    # of five categories, (3) send aggregate stats + a sample drawn from
+    # each category so Gemini can score based on the population, not the
+    # first-page sample.
     imgs = soup.find_all("img")
-    img_sample = []
-    for img in imgs[:20]:
-        alt = img.get("alt", "MISSING")
-        src = img.get("src","")[:60]
-        img_sample.append(f"alt={repr(alt)} src={src}")
-    out.append(f"IMAGES (total: {len(imgs)}):\n" + "\n".join(img_sample))
+
+    def _is_content_image(img):
+        src = img.get("src", "") or img.get("data-src", "")
+        if not src:
+            return False
+        if src.startswith("data:"):
+            return False  # inline SVG / base64 placeholder
+        # 1×1 tracking pixels
+        try:
+            w = int(img.get("width", "999"))
+            h = int(img.get("height", "999"))
+            if w < 10 and h < 10:
+                return False
+        except (ValueError, TypeError):
+            pass
+        return True
+
+    def _classify_img(img):
+        # img.has_attr distinguishes "no alt attribute at all" (missing)
+        # from "alt='' explicitly" (empty).
+        if not img.has_attr("alt"):
+            return "missing"
+        alt = (img.get("alt") or "").strip()
+        if not alt:
+            # Empty alt is CORRECT WCAG when the image is inside a link or
+            # figure whose text provides the accessible name. Detect that
+            # pattern so we don't penalise the site for doing it right.
+            parent_link = img.find_parent("a")
+            if parent_link:
+                # Get link text without the image contributing
+                link_text = parent_link.get_text(" ", strip=True)
+                if link_text and len(link_text) >= 3:
+                    return "empty_decorative"
+            parent_fig = img.find_parent("figure")
+            if parent_fig and parent_fig.find("figcaption"):
+                cap = parent_fig.find("figcaption").get_text(strip=True)
+                if cap and len(cap) >= 3:
+                    return "empty_decorative"
+            return "empty_bare"
+        if len(alt) < 5:
+            return "too_short"
+        return "descriptive"
+
+    content_imgs = [img for img in imgs if _is_content_image(img)]
+    total_all       = len(imgs)
+    total_content   = len(content_imgs)
+    counts = {"missing": 0, "empty_bare": 0, "empty_decorative": 0,
+              "too_short": 0, "descriptive": 0}
+    for img in content_imgs:
+        counts[_classify_img(img)] += 1
+
+    # Draw up to 3 samples from each category so Gemini sees the mix
+    per_cat_samples = {k: [] for k in counts}
+    for img in content_imgs:
+        cls = _classify_img(img)
+        if len(per_cat_samples[cls]) < 3:
+            alt_repr = repr(img.get("alt")) if img.has_attr("alt") else "MISSING"
+            src = (img.get("src", "") or img.get("data-src", ""))[-70:]
+            per_cat_samples[cls].append(f"  [{cls}] alt={alt_repr} src=...{src}")
+
+    def _pct(c):
+        return f"{c} ({round(100 * c / total_content) if total_content else 0}%)"
+
+    img_lines = [
+        f"IMAGES: {total_content} content images ({total_all} total including tracking pixels/SVG placeholders).",
+        f"  Descriptive alt (≥5 chars):                    {_pct(counts['descriptive'])}",
+        f"  Empty alt with adjacent link/caption text:     {_pct(counts['empty_decorative'])}  ← WCAG-correct for decorative use",
+        f"  Empty alt with NO accessible context:          {_pct(counts['empty_bare'])}  ← genuine gap",
+        f"  Alt attribute entirely missing:                {_pct(counts['missing'])}  ← genuine gap",
+        f"  Alt too short (<5 chars, non-empty):           {_pct(counts['too_short'])}  ← weak / auto-generated",
+    ]
+    # Add samples, category by category, so Gemini can eyeball each class
+    img_lines.append("Sample images by category:")
+    for cls in ("descriptive", "empty_decorative", "empty_bare", "missing", "too_short"):
+        if per_cat_samples[cls]:
+            img_lines.extend(per_cat_samples[cls])
+    out.append("\n".join(img_lines))
 
     # ── Inline JS data stores (Next.js, Nuxt, etc.) ─────────────────
     # Even JS-heavy sites embed page data in __NEXT_DATA__ or similar
@@ -1036,7 +1116,18 @@ Score EACH page 1-10 across these 9 dimensions:
    SCORE 10: Reserved for exemplary implementations across every metadata surface.
    IMPORTANT: Do NOT award high META scores just because Open Graph is comprehensive. OG tags improve social sharing appearance, they do not meaningfully improve AI visibility. The core AI signals are title, description, canonical and lang.
 5. LINKS – internal link quality, anchor text, protocol consistency, density
-6. ALT TEXT – image alt attribute quality and completeness
+6. ALT TEXT – image alt attribute quality and completeness. Use these criteria and score based on the AGGREGATE STATS (percentages) reported in the IMAGES section, not just the sample lines. Distinguish the two failure modes from the WCAG-correct decorative pattern:
+   - "Descriptive alt" = a real, meaningful alt attribute of 5+ characters. This is the ideal for AI understanding.
+   - "Empty alt with adjacent link/caption text" = alt="" on an image inside an <a> whose visible text names the target (e.g. an artist thumbnail linked to /artists/doug-hyde with the text "Doug Hyde" next to it). This is CORRECT WCAG practice for decorative images — screen readers would otherwise read the label twice. Do NOT penalise heavily for this; treat it as "acceptable but a missed AI-context opportunity". At worst a -1 to -2 from a full score.
+   - "Empty alt with NO accessible context" = alt="" on an image with no adjacent text or caption. Genuine gap.
+   - "Alt attribute entirely missing" = no alt="…" at all in the HTML. Genuine gap and also an accessibility failure.
+   - "Alt too short (<5 chars)" = alt attributes like "img", "x", "1" — usually auto-generated placeholders. Genuine gap.
+   SCORE 1-2: More than 50% of content images have missing or bare-empty alt AND the site is content-heavy (product images, photos, illustrations that need description). Reserve this only for genuinely broken sites.
+   SCORE 3-4: 30–50% missing/bare-empty, or the descriptive alt attributes that do exist are template repetitions (e.g. every image says "product image") that give AI no differentiating information.
+   SCORE 5-6: Mixed — some descriptive alt, some empty, but most empties are the WCAG-correct decorative pattern with adjacent link text. Room for improvement on the truly content-heavy images (product hero shots, article images).
+   SCORE 7-8: Majority of content images have descriptive alt of 5+ chars, or all empties follow the WCAG decorative pattern and the site's key content images (heroes, product photos, article images) are all covered.
+   SCORE 9-10: Descriptive alt on essentially all content images, with meaningful text (not template repetition). Reserve 10 for alt attributes that materially help AI understand the image content (artist name, product name + attribute, article subject).
+   IMPORTANT: The IMAGES section gives you percentages. If "Descriptive alt: 62%" and "Empty alt with adjacent link/caption text: 30%" (WCAG-correct), that's roughly a 7 — the site is doing the right thing. Do NOT default to 1-2 just because the sample lines show a run of alt='' — check whether those empties are the decorative pattern (they have an [empty_decorative] tag in the sample).
 7. CRAWL – server-rendered static HTML vs JS dependency
 8. LLM – first-hand expertise, named entities, dates, citations, authority signals
 9. CONTENT QUALITY – Score this dimension rigorously. Most commercial pages score 3-5, not 7-9. Use these specific criteria:
