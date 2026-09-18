@@ -1530,10 +1530,14 @@ def run_audit(model, pages: dict) -> dict:
     return result
 
 # ─── Score colour ─────────────────────────────────────────────────────────────
+# Thresholds (applied to a score out of 10, including decimal averages):
+#   0.0 – 3.9  → red    (poor)
+#   4.0 – 7.4  → amber  (mixed)
+#   7.5 – 10   → green  (strong)
 def score_color(s):
-    if s <= 2: return "#C0392B"   # red
-    if s <= 5: return "#E67E22"   # amber
-    return "#27AE60"              # green
+    if s < 4:   return "#C0392B"   # red
+    if s < 7.5: return "#E67E22"   # amber
+    return "#27AE60"               # green
 
 # ─── Build Word doc ───────────────────────────────────────────────────────────
 def build_docx(data: dict, month_year: str) -> bytes:
@@ -1649,8 +1653,9 @@ def build_docx(data: dict, month_year: str) -> bytes:
     dim_labels = ["ARIA","SCHEMA","HEADINGS","META","LINKS","ALT TEXT","CRAWL","LLM","CONTENT"]
 
     def score_color_hex(s):
-        if s <= 2: return "C0392B"
-        if s <= 5: return "E67E22"
+        # 0-3.9 red, 4-7.4 amber, 7.5-10 green
+        if s < 4:   return "C0392B"
+        if s < 7.5: return "E67E22"
         return "27AE60"
 
     # Enrich data with derived fields the JS needs
@@ -1774,7 +1779,8 @@ function hdrCell(label, width, bg) {
   );
 }
 function scoreCell(score, width) {
-  const col = score <= 2 ? 'C0392B' : score <= 5 ? 'E67E22' : '27AE60';
+  // 0-3.9 red, 4-7.4 amber, 7.5-10 green
+  const col = score < 4 ? 'C0392B' : score < 7.5 ? 'E67E22' : '27AE60';
   return cell(
     [para([txt(score + '/10', { bold: true, color: 'FFFFFF', size: 22 })])],
     width,
@@ -2141,8 +2147,9 @@ def build_onepager(data: dict, month_year: str) -> bytes:
     WHITE = colors.white
 
     def dim_color(s):
-        if s <= 2: return colors.HexColor("#C0392B")
-        if s <= 5: return colors.HexColor("#E67E22")
+        # 0-3.9 red, 4-7.4 amber, 7.5-10 green
+        if s < 4:   return colors.HexColor("#C0392B")
+        if s < 7.5: return colors.HexColor("#E67E22")
         return colors.HexColor("#27AE60")
 
     def safe(t):
@@ -2534,8 +2541,9 @@ def build_onepager_docx(data: dict, month_year: str) -> bytes:
             s = float(s)
         except (TypeError, ValueError):
             s = 0
-        if s <= 2: return "C0392B"
-        if s <= 5: return "E67E22"
+        # 0-3.9 red, 4-7.4 amber, 7.5-10 green
+        if s < 4:   return "C0392B"
+        if s < 7.5: return "E67E22"
         return "27AE60"
 
     def clean(t):
