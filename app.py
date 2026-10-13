@@ -734,58 +734,128 @@ def extract_page_signals(url: str, html: str) -> str:
             pass
 
     # ── Body content sample (for LLM & CONTENT signal) ───────────────
-    # Priority order: prefer <main>, then <article>, then a #content /
-    # role="main" container, then finally fall back to <body> minus the
-    # nav/header/footer. This ensures we sample the ACTUAL page content
-    # (product descriptions, article body, etc.) not the mega-menu.
-    body_sample = ""
-    main_candidates = []
+    # Modern CMS/SPA sites render enormous mega-menus and category trees
+    # directly into the DOM for SEO (hundreds of category links, "shop by
+    # X" dropdowns, etc). These nav blocks often sit INSIDE the <main> or
+    # <article> container, so a naive `.get_text()` on the semantic
+    # container pulls back mostly nav. We have to deeply strip nav-like
+    # elements from every candidate BEFORE measuring text length or sampling.
+    #
+    # Patterns like "nav", "menu", "header", "footer", "sidebar",
+    # "megamenu", "dropdown", "cross-sell", "breadcrumb", "cookie",
+    # "newsletter", "promo", "related", "share", "social", etc. are all
+    # non-content on virtually every site.
+    _JUNK_CLASS_RE = _re.compile(
+        r"\b("
+        r"nav|navigation|navbar|menu|megamenu|mega-menu|dropdown|offcanvas|"
+        r"header|site-header|page-header|footer|site-footer|page-footer|"
+        r"sidebar|side-nav|aside|"
+        r"breadcrumb|crumbs|"
+        r"cookie|consent|gdpr|banner|announcement|notification|alert-bar|"
+        r"skip-|skip_|utility-|utility_|toolbar|"
+        r"login|signin|signup|account|basket|cart|minicart|wishlist|"
+        r"search-form|searchbar|"
+        r"newsletter|subscribe|"
+        r"related|cross-sell|crosssell|upsell|recommend|you-may-also|"
+        r"promo|promotion|banner-ad|advert|"
+        r"share|social|follow-us|"
+        r"footer-links|footer-nav|footer-menu|"
+        r"filter|facet|pagination|sort-by"
+        r")\b",
+        _re.I
+    )
+    _JUNK_ROLE_RE = _re.compile(
+        r"^(navigation|banner|contentinfo|search|complementary|form)$",
+        _re.I
+    )
 
-    # Try semantic containers first
-    for selector in [
-        {"name": "main"},
-        {"name": "article"},
-        {"attrs": {"role": "main"}},
-        {"attrs": {"id": _re.compile(r"main|content|product", _re.I)}},
-        {"attrs": {"class": _re.compile(r"product-description|product-details|product__description|main-content|page-content|article-body|entry-content|post-content", _re.I)}},
+    def _deeply_strip(elem) -> str:
+        """
+        Return the text of `elem` after removing all nav/menu/footer/aside/
+        form/script/style descendants, plus anything matching junk class, id
+        or role patterns. Operates on a clone so the original soup is untouched.
+        """
+        clone = BeautifulSoup(str(elem), "html.parser")
+        # Semantic non-content tags
+        for junk in clone(["nav", "header", "footer", "aside", "form",
+                           "script", "style", "noscript", "template", "svg"]):
+            junk.decompose()
+        # Class / id / role patterns
+        for junk in clone.find_all(attrs={"class": _JUNK_CLASS_RE}):
+            junk.decompose()
+        for junk in clone.find_all(attrs={"id": _JUNK_CLASS_RE}):
+            junk.decompose()
+        for junk in clone.find_all(attrs={"role": _JUNK_ROLE_RE}):
+            junk.decompose()
+        return " ".join(clone.get_text(" ", strip=True).split())
+
+    body_sample = ""
+    picked_from = ""
+
+    # Try semantic containers in strongest-signal-first order.
+    # <article> is the most content-specific; prefer it over <main>, which
+    # on many SPAs is a top-level wrapper that includes nav.
+    for container_name, finder in [
+        ("<article>",            lambda: soup.find_all("article")),
+        ("<main>",               lambda: soup.find_all("main")),
+        ("role=main",            lambda: soup.find_all(attrs={"role": "main"})),
+        ("id=main|content|…",    lambda: soup.find_all(attrs={"id": _re.compile(r"^(main|content|page-content|product|article|post)", _re.I)})),
+        ("class=content|…",      lambda: soup.find_all(attrs={"class": _re.compile(r"\b(article-body|entry-content|post-content|product-description|product-details|product__description|page-content|main-content|rich-text|prose)\b", _re.I)})),
     ]:
         try:
-            found = soup.find_all(**selector)
+            candidates = finder()
         except Exception:
-            found = []
-        for f in found:
-            txt = " ".join(f.get_text(" ", strip=True).split())
-            if len(txt) > 100:
-                main_candidates.append(txt)
-        if main_candidates:
+            candidates = []
+        if not candidates:
+            continue
+        cleaned = []
+        for c in candidates:
+            txt = _deeply_strip(c)
+            # 300 chars is a reasonable "this is real content" threshold —
+            # genuine article/product copy almost always exceeds that; a
+            # near-empty wrapper won't.
+            if len(txt) >= 300:
+                cleaned.append(txt)
+        if cleaned:
+            # Pick the longest; multiple article/main elements usually means
+            # one is the real one and others are promo cards, so longest wins.
+            cleaned.sort(key=len, reverse=True)
+            body_sample = cleaned[0][:4500]
+            picked_from = f"semantic container: {container_name}"
             break
 
-    if main_candidates:
-        # Use the longest main candidate — biggest content block wins
-        main_candidates.sort(key=len, reverse=True)
-        body_sample = main_candidates[0][:3500]
-        out.append(f"MAIN_CONTENT (from semantic container):\n{body_sample}")
-    else:
-        # Fallback: full body minus nav/header/footer/aside
+    if not body_sample:
+        # Fallback: whole body minus nav/menu/footer/aside/form & junk classes
         body = soup.find("body")
         if body:
-            body_copy = BeautifulSoup(str(body), "html.parser")
-            for junk in body_copy(["nav","header","footer","aside","form"]):
-                junk.decompose()
-            # Also strip common nav/footer class patterns
-            for junk in body_copy.find_all(
-                attrs={"class": _re.compile(r"nav|menu|header|footer|cookie|banner|breadcrumb|sidebar", _re.I)}
-            ):
-                junk.decompose()
-            text = " ".join(body_copy.get_text(" ", strip=True).split())[:3500]
-            out.append(f"BODY_TEXT_SAMPLE (nav stripped):\n{text}")
+            body_sample = _deeply_strip(body)[:4500]
+            picked_from = "body with nav/menu/footer stripped"
 
-    # Also include a shorter raw body sample so Gemini can still audit
-    # nav content signals like "Shop by Category" etc.
+    if body_sample:
+        out.append(
+            f"MAIN_CONTENT ({picked_from}):\n"
+            f"[This is the actual page content with navigation, mega-menus, "
+            f"headers, footers, cookie banners, promos and cross-sell blocks "
+            f"removed. If this is empty or short, the page genuinely has thin "
+            f"content; if it contains article/product/category copy, that is "
+            f"the real content for scoring.]\n{body_sample}"
+        )
+    else:
+        out.append("MAIN_CONTENT: [extraction found no content > 300 chars after nav stripping]")
+
+    # Short RAW_BODY_START signal — kept so Gemini can audit nav scaffolding
+    # (presence of breadcrumbs, cookie banners, etc.) — but clearly labelled
+    # as "navigation and scaffolding, NOT page content", so Gemini doesn't
+    # mistakenly score content quality from it.
     body = soup.find("body")
     if body:
-        raw_snippet = " ".join(body.get_text(" ", strip=True).split())[:800]
-        out.append(f"RAW_BODY_START (first 800 chars including nav):\n{raw_snippet}")
+        raw_snippet = " ".join(body.get_text(" ", strip=True).split())[:600]
+        out.append(
+            f"RAW_BODY_START (first 600 chars — this is NAVIGATION and page "
+            f"scaffolding, not the article/product content. Do NOT score "
+            f"CONTENT QUALITY from this field; use MAIN_CONTENT above):\n"
+            f"{raw_snippet}"
+        )
 
     return "\n\n".join(out)
 
@@ -1138,7 +1208,7 @@ Score EACH page 1-10 across these 9 dimensions:
    SCORE 10: Reserved for editorial or guide content that is comprehensive, cites sources, names experts, and fully answers a user's question with no gaps.
    IMPORTANT: A product page that simply lists specifications and says "free delivery" scores NO HIGHER than 4. A category page that lists products with no explanatory copy scores 1-2.
 
-   CRITICAL SCORING RULE: Score ONLY on the content you can actually see in the MAIN_CONTENT and BODY_TEXT_SAMPLE fields. Do NOT assume, infer, or hope that expanded content exists beyond what is shown. If the extracted content is thin, the page IS thin — score it accordingly. Never write phrases like "assuming the full description expands on this" or "if the page includes more detail" — if you did not see the content, it does not count. If a product page's visible content is just the product name, price, and a spec list, score 1-3 regardless of what OG or schema description says. Meta and schema descriptions are marketing summaries, they are NOT the on-page content and do not count toward CONTENT QUALITY scoring.
+   CRITICAL SCORING RULE: Score CONTENT QUALITY and LLM dimensions ONLY from the MAIN_CONTENT field. That field is specifically the body/article/product/category copy with navigation, mega-menus, headers, footers, cookie banners, breadcrumbs, cross-sell blocks and other scaffolding REMOVED. The RAW_BODY_START field is deliberately labelled as navigation and scaffolding — do NOT score CONTENT QUALITY from it. If MAIN_CONTENT contains substantive article/product/category copy (symptom lists, product descriptions, category introductions, how-to steps, FAQ answers, etc.), that IS the real page content, even if RAW_BODY_START shows a long nav list. Do not conclude that a page "has no content" just because the raw body opens with navigation — modern CMS/SPA sites render nav directly into the DOM. Only conclude a page is thin when MAIN_CONTENT itself is short or missing. Do not assume, infer, or hope that expanded content exists beyond what MAIN_CONTENT shows. If MAIN_CONTENT is genuinely thin, the page IS thin — score it accordingly. Never write phrases like "assuming the full description expands on this" or "the MAIN_CONTENT is purely navigational" (the extractor explicitly removes navigation; if nav is reaching MAIN_CONTENT despite stripping, mention it in the detail but still look for whatever article/product copy IS present). Meta and schema descriptions are marketing summaries, they are NOT on-page content and do not count toward CONTENT QUALITY scoring.
 
 CRITICAL RULES FOR JSON:
 - Return ONLY raw JSON. No markdown, no ```json fences, no preamble, no explanation.
